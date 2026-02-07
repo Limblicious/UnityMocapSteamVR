@@ -68,8 +68,8 @@ Calibrates VR tracker-to-bone offsets by having the user hold a T-pose. Aligns t
 
 1. The user holds a T-pose during a countdown.
 2. Tracker and bone positions/rotations are sampled over a configurable window.
-3. **Head-anchored alignment**: the `TrackingRoot` transform is repositioned/rotated so that the head tracker matches the avatar's Head bone exactly. The head becomes the "source of truth" for the tracking coordinate space.
-4. For all other trackers, a local offset (`*_Off` child transform) is computed so that the offset transform's world pose matches the corresponding avatar bone.
+3. **Head-anchored yaw alignment**: the `TrackingRoot` transform is repositioned and yaw-rotated so the head tracker lines up with the avatar's Head bone. Only yaw (Y-axis rotation) is applied to TrackingRoot to avoid tilting the entire tracking space -- any head pitch/roll during the T-pose is handled per-tracker instead.
+4. For each tracker (including head), a local offset (`*_Off` child transform) is computed from the sampled data so that the offset transform's world pose matches the corresponding avatar bone. Offsets are derived entirely from the averaged sample window, not from live tracker transforms, eliminating drift between the sampling and application phases.
 5. VRIK targets should point to these `*_Off` transforms instead of raw tracked objects.
 
 ### Usage
@@ -84,7 +84,7 @@ Calibrates VR tracker-to-bone offsets by having the user hold a T-pose. Aligns t
 
 | Tracked Object | Offset Child | Avatar Bone | Notes |
 |----------------|-------------|-------------|-------|
-| `Tracked_Head` | `Head_Off` | Head | Anchor (offset always identity) |
+| `Tracked_Head` | `Head_Off` | Head | Yaw anchor; offset handles remaining pitch/roll |
 | `Tracked_HandL` | `HandL_Off` | LeftHand | |
 | `Tracked_HandR` | `HandR_Off` | RightHand | |
 | `Tracked_Hips` | `Pelvis_Off` | Hips | Also accepts `Tracked_Waist` |

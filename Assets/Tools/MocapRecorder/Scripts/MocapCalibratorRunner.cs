@@ -424,7 +424,12 @@ namespace MocapTools
             StatusMessage = "Applying offsets...";
             yield return null;
 
-            // Step 2: Apply offsets to each tracker (head gets identity, others get computed offsets)
+            // Step 2: Apply offsets to each tracker.
+            // Use sampled local averages + aligned TrackingRoot pose to compute
+            // expected tracker world poses, avoiding stale/live data mixing.
+            Quaternion alignedTRRot = _currentRequest.TrackingRoot.rotation;
+            Vector3 alignedTRPos = _currentRequest.TrackingRoot.position;
+
             foreach (var mapping in mappings)
             {
                 if (!mapping.IsValid)
@@ -450,36 +455,21 @@ namespace MocapTools
                     continue;
                 }
 
-                // Special handling for HEAD - it's the anchor, so offset is identity
-                if (mapping.TrackerName == HEAD_TRACKER_NAME)
-                {
-                    mapping.OffsetTransform.localPosition = Vector3.zero;
-                    mapping.OffsetTransform.localRotation = Quaternion.identity;
-
-                    Results.Add(new CalibrationResult
-                    {
-                        TrackerName = mapping.TrackerName,
-                        AppliedLocalPosition = Vector3.zero,
-                        AppliedLocalRotation = Quaternion.identity,
-                        Success = true,
-                        ErrorMessage = "Head anchor: offset reset to identity"
-                    });
-
-                    Debug.Log($"[MocapCalibrator] {mapping.TrackerName} -> {mapping.OffsetChildName}: " +
-                              "HEAD ANCHOR - offset set to identity");
-                    continue;
-                }
-
-                // For all other trackers: compute offset using CURRENT tracker transform (post-alignment)
-                // and the averaged bone pose from sampling
+                // Average all sampled data for this tracker
                 Vector3 avgBonePos = AveragePositions(data.BonePositions);
                 Quaternion avgBoneRot = AverageRotations(data.BoneRotations);
+                Vector3 avgTrackerLocalPos = AveragePositions(data.LocalPositions);
+                Quaternion avgTrackerLocalRot = AverageRotations(data.LocalRotations);
 
-                // Use current tracker world pose (after TrackingRoot alignment)
-                // localPos = trackerT.InverseTransformPoint(avgBonePos)
-                // localRot = Inverse(currentTrackerRot) * avgBoneRot
-                Vector3 localPos = mapping.TrackerTransform.InverseTransformPoint(avgBonePos);
-                Quaternion localRot = Quaternion.Inverse(mapping.TrackerTransform.rotation) * avgBoneRot;
+                // Compute expected tracker world pose from sampled local pose + aligned TrackingRoot.
+                // This uses all data from the same sampling window, eliminating drift from
+                // the frames between sampling and offset application.
+                Vector3 expectedWorldPos = alignedTRPos + alignedTRRot * avgTrackerLocalPos;
+                Quaternion expectedWorldRot = alignedTRRot * avgTrackerLocalRot;
+
+                // Offset from expected tracker pose to bone pose (manual InverseTransformPoint)
+                Vector3 localPos = Quaternion.Inverse(expectedWorldRot) * (avgBonePos - expectedWorldPos);
+                Quaternion localRot = Quaternion.Inverse(expectedWorldRot) * avgBoneRot;
 
                 // Apply to offset transform
                 mapping.OffsetTransform.localPosition = localPos;
@@ -589,15 +579,17 @@ namespace MocapTools
             Vector3 avgHeadBoneWorldPos = AveragePositions(headSamples.BonePositions);
             Quaternion avgHeadBoneWorldRot = AverageRotations(headSamples.BoneRotations);
 
-            // Compute new TrackingRoot world rotation and position so that:
-            //   TrackingRootRot * avgHeadTrackerLocalRot == avgHeadBoneWorldRot
-            //   TrackingRootPos + TrackingRootRot * avgHeadTrackerLocalPos == avgHeadBoneWorldPos
-            //
-            // Therefore:
-            //   newTRRot = avgHeadBoneWorldRot * Inverse(avgHeadTrackerLocalRot)
-            //   newTRPos = avgHeadBoneWorldPos - (newTRRot * avgHeadTrackerLocalPos)
+            // Compute full rotation that would match head tracker to head bone:
+            //   fullRot * avgHeadTrackerLocalRot == avgHeadBoneWorldRot
+            Quaternion fullAlignRot = avgHeadBoneWorldRot * Quaternion.Inverse(avgHeadTrackerLocalRot);
 
-            Quaternion newTrackingRootRot = avgHeadBoneWorldRot * Quaternion.Inverse(avgHeadTrackerLocalRot);
+            // Extract YAW only for TrackingRoot alignment.
+            // Applying full pitch/roll to TrackingRoot shifts all non-head trackers
+            // laterally (e.g., hip pushed to the side from even small head tilts).
+            // Per-tracker offsets handle remaining pitch/roll individually.
+            Vector3 fullEuler = fullAlignRot.eulerAngles;
+            Quaternion newTrackingRootRot = Quaternion.Euler(0f, fullEuler.y, 0f);
+
             Vector3 newTrackingRootPos = avgHeadBoneWorldPos - (newTrackingRootRot * avgHeadTrackerLocalPos);
 
             // Store old values for logging
