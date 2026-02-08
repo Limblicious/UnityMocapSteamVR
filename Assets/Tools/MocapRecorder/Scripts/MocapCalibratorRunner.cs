@@ -124,8 +124,8 @@ namespace MocapTools
             ("Tracked_Head", "Head_Off", HumanBodyBones.Head, true, false),
             ("Tracked_HandL", "HandL_Off", HumanBodyBones.LeftHand, true, false),
             ("Tracked_HandR", "HandR_Off", HumanBodyBones.RightHand, true, false),
-            ("Tracked_Hips", "Pelvis_Off", HumanBodyBones.Hips, true, false),
-            ("Tracked_Waist", "Pelvis_Off", HumanBodyBones.Hips, true, false),  // Alternative name
+            ("Tracked_Hips", "Hips_Off", HumanBodyBones.Hips, true, false),
+            ("Tracked_Waist", "Hips_Off", HumanBodyBones.Hips, true, false),  // Alternative name
             ("Tracked_FootL", "FootL_Off", HumanBodyBones.LeftFoot, true, false),
             ("Tracked_FootR", "FootR_Off", HumanBodyBones.RightFoot, true, false),
             ("Tracked_ElbowL", "ElbowL_Off", HumanBodyBones.LeftLowerArm, false, true),

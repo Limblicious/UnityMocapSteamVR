@@ -89,7 +89,7 @@ Calibrates VR tracker-to-bone offsets by having the user hold a T-pose. Aligns t
 | `Tracked_Head` | `Head_Off` | Head | Yaw anchor; offset handles remaining pitch/roll |
 | `Tracked_HandL` | `HandL_Off` | LeftHand | Zero position offset (tracker-direct) |
 | `Tracked_HandR` | `HandR_Off` | RightHand | Zero position offset (tracker-direct) |
-| `Tracked_Hips` | `Pelvis_Off` | Hips | Also accepts `Tracked_Waist`; position via proportion scaler |
+| `Tracked_Hips` | `Hips_Off` | Hips | Also accepts `Tracked_Waist`; position via proportion scaler |
 | `Tracked_FootL` | `FootL_Off` | LeftFoot | Position via proportion scaler; foot rotation toggle |
 | `Tracked_FootR` | `FootR_Off` | RightFoot | Position via proportion scaler; foot rotation toggle |
 | `Tracked_ElbowL` | `ElbowL_Off` | LeftLowerArm | Position only |
