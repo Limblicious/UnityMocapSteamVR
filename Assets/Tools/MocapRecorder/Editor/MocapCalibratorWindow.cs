@@ -28,7 +28,7 @@ namespace MocapTools
         // Settings
         private float _countdownSeconds = 5f;
         private float _sampleDurationSeconds = 0.5f;
-        private bool _disableVRIKDuringCalibration = true;
+        private bool _enableVRIKAfterCalibration = true;
         private bool _freezeAnimatorDuringCalibration = false;
         private bool _applyRotationForHeadHandsFeetPelvis = true;
         private bool _applyRotationForFeet = true;
@@ -330,11 +330,12 @@ namespace MocapTools
 
             EditorGUILayout.Space(5);
 
-            _disableVRIKDuringCalibration = EditorGUILayout.Toggle(
-                new GUIContent("Disable VRIK During Calibration",
-                    "Temporarily disable VRIK so avatar stays in reference pose.\n" +
+            _enableVRIKAfterCalibration = EditorGUILayout.Toggle(
+                new GUIContent("Enable VRIK After Calibration",
+                    "Automatically enable VRIK after calibration completes.\n" +
+                    "VRIK should already be disabled before starting calibration.\n" +
                     "Recommended: ON"),
-                _disableVRIKDuringCalibration);
+                _enableVRIKAfterCalibration);
 
             _freezeAnimatorDuringCalibration = EditorGUILayout.Toggle(
                 new GUIContent("Freeze Animator During Calibration",
@@ -545,7 +546,7 @@ namespace MocapTools
                 TrackingRoot = _trackingRoot,
                 CountdownSeconds = _countdownSeconds,
                 SampleDurationSeconds = _sampleDurationSeconds,
-                DisableVRIKDuringCalibration = _disableVRIKDuringCalibration,
+                EnableVRIKAfterCalibration = _enableVRIKAfterCalibration,
                 FreezeAnimatorDuringCalibration = _freezeAnimatorDuringCalibration,
                 ApplyRotationForHeadHandsFeetPelvis = _applyRotationForHeadHandsFeetPelvis,
                 ApplyRotationForFeet = _applyRotationForFeet
@@ -771,7 +772,7 @@ namespace MocapTools
         {
             _countdownSeconds = EditorPrefs.GetFloat(PREFS_COUNTDOWN, 5f);
             _sampleDurationSeconds = EditorPrefs.GetFloat(PREFS_SAMPLE_DURATION, 0.5f);
-            _disableVRIKDuringCalibration = EditorPrefs.GetBool(PREFS_DISABLE_VRIK, true);
+            _enableVRIKAfterCalibration = EditorPrefs.GetBool(PREFS_DISABLE_VRIK, true);
             _freezeAnimatorDuringCalibration = EditorPrefs.GetBool(PREFS_FREEZE_ANIMATOR, false);
             _applyRotationForHeadHandsFeetPelvis = EditorPrefs.GetBool(PREFS_APPLY_ROT, true);
             _applyRotationForFeet = EditorPrefs.GetBool(PREFS_APPLY_ROT_FEET, true);
@@ -781,7 +782,7 @@ namespace MocapTools
         {
             EditorPrefs.SetFloat(PREFS_COUNTDOWN, _countdownSeconds);
             EditorPrefs.SetFloat(PREFS_SAMPLE_DURATION, _sampleDurationSeconds);
-            EditorPrefs.SetBool(PREFS_DISABLE_VRIK, _disableVRIKDuringCalibration);
+            EditorPrefs.SetBool(PREFS_DISABLE_VRIK, _enableVRIKAfterCalibration);
             EditorPrefs.SetBool(PREFS_FREEZE_ANIMATOR, _freezeAnimatorDuringCalibration);
             EditorPrefs.SetBool(PREFS_APPLY_ROT, _applyRotationForHeadHandsFeetPelvis);
             EditorPrefs.SetBool(PREFS_APPLY_ROT_FEET, _applyRotationForFeet);

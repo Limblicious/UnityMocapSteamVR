@@ -57,7 +57,7 @@ namespace MocapTools
             public Transform TrackingRoot;
             public float CountdownSeconds = 5f;
             public float SampleDurationSeconds = 0.5f;
-            public bool DisableVRIKDuringCalibration = true;
+            public bool EnableVRIKAfterCalibration = true;
             public bool FreezeAnimatorDuringCalibration = false;
             public bool ApplyRotationForHeadHandsFeetPelvis = true;
             public bool ApplyRotationForFeet = true;
@@ -98,7 +98,6 @@ namespace MocapTools
         private CalibrationRequest _currentRequest;
         private MonoBehaviour _vrikComponent;
         private Animator _animator;
-        private bool _vrikWasEnabled;
         private bool _animatorWasEnabled;
 
         // Sampling data
@@ -257,9 +256,9 @@ namespace MocapTools
 
             // Find VRIK
             _vrikComponent = FindVRIK(_currentRequest.CharacterRoot);
-            if (_vrikComponent == null && _currentRequest.DisableVRIKDuringCalibration)
+            if (_vrikComponent == null && _currentRequest.EnableVRIKAfterCalibration)
             {
-                Debug.LogWarning("[MocapCalibrator] VRIK component not found. Continuing without disabling VRIK.");
+                Debug.LogWarning("[MocapCalibrator] VRIK component not found. VRIK will not be enabled after calibration.");
             }
 
             // Build mappings
@@ -323,14 +322,7 @@ namespace MocapTools
 
             Debug.Log($"[MocapCalibrator] Found {validMappings} valid mappings. Starting countdown...");
 
-            // Disable VRIK/Animator during calibration
-            if (_currentRequest.DisableVRIKDuringCalibration && _vrikComponent != null)
-            {
-                _vrikWasEnabled = ((Behaviour)_vrikComponent).enabled;
-                ((Behaviour)_vrikComponent).enabled = false;
-                Debug.Log("[MocapCalibrator] VRIK disabled for calibration.");
-            }
-
+            // Freeze animator during calibration if requested
             if (_currentRequest.FreezeAnimatorDuringCalibration && _animator != null)
             {
                 _animatorWasEnabled = _animator.enabled;
@@ -430,6 +422,17 @@ namespace MocapTools
             Quaternion alignedTRRot = _currentRequest.TrackingRoot.rotation;
             Vector3 alignedTRPos = _currentRequest.TrackingRoot.position;
 
+            // Proportion scaling: collect tracker and bone world positions during
+            // the offset loop, then compute per-limb scale factors after.
+            Vector3 headTrackerWPos = Vector3.zero, hipTrackerWPos = Vector3.zero;
+            Vector3 footLTrackerWPos = Vector3.zero, footRTrackerWPos = Vector3.zero;
+            Vector3 headBoneWPos = Vector3.zero, hipBoneWPos = Vector3.zero;
+            Vector3 footLBoneWPos = Vector3.zero, footRBoneWPos = Vector3.zero;
+            bool hasHead = false, hasHip = false, hasFootL = false, hasFootR = false;
+            Transform headTrackerRef = null, hipTrackerRef = null;
+            Transform footLTrackerRef = null, footRTrackerRef = null;
+            Transform hipOffsetRef = null, footLOffsetRef = null, footROffsetRef = null;
+
             foreach (var mapping in mappings)
             {
                 if (!mapping.IsValid)
@@ -471,6 +474,52 @@ namespace MocapTools
                 Vector3 localPos = Quaternion.Inverse(expectedWorldRot) * (avgBonePos - expectedWorldPos);
                 Quaternion localRot = Quaternion.Inverse(expectedWorldRot) * avgBoneRot;
 
+                // Collect proportion data for scaled trackers
+                bool isHand = (mapping.Bone == HumanBodyBones.LeftHand ||
+                               mapping.Bone == HumanBodyBones.RightHand);
+                bool isHip = (mapping.Bone == HumanBodyBones.Hips);
+                bool isFoot = (mapping.Bone == HumanBodyBones.LeftFoot ||
+                               mapping.Bone == HumanBodyBones.RightFoot);
+
+                if (mapping.Bone == HumanBodyBones.Head)
+                {
+                    headTrackerWPos = expectedWorldPos;
+                    headBoneWPos = avgBonePos;
+                    headTrackerRef = mapping.TrackerTransform;
+                    hasHead = true;
+                }
+                else if (isHip)
+                {
+                    hipTrackerWPos = expectedWorldPos;
+                    hipBoneWPos = avgBonePos;
+                    hipTrackerRef = mapping.TrackerTransform;
+                    hipOffsetRef = mapping.OffsetTransform;
+                    hasHip = true;
+                }
+                else if (mapping.Bone == HumanBodyBones.LeftFoot)
+                {
+                    footLTrackerWPos = expectedWorldPos;
+                    footLBoneWPos = avgBonePos;
+                    footLTrackerRef = mapping.TrackerTransform;
+                    footLOffsetRef = mapping.OffsetTransform;
+                    hasFootL = true;
+                }
+                else if (mapping.Bone == HumanBodyBones.RightFoot)
+                {
+                    footRTrackerWPos = expectedWorldPos;
+                    footRBoneWPos = avgBonePos;
+                    footRTrackerRef = mapping.TrackerTransform;
+                    footROffsetRef = mapping.OffsetTransform;
+                    hasFootR = true;
+                }
+
+                // Hands: zero position - hand trackers have high accuracy.
+                // Hips/Feet: zero position - proportion scaler handles positioning.
+                if (isHand || isHip || isFoot)
+                {
+                    localPos = Vector3.zero;
+                }
+
                 // Apply to offset transform
                 mapping.OffsetTransform.localPosition = localPos;
 
@@ -495,8 +544,67 @@ namespace MocapTools
                           $"localPos={localPos}, localRot={localRot.eulerAngles}");
             }
 
-            // Restore VRIK/Animator
+            // Step 3: Compute proportion scale factors and create runtime scaler.
+            // Measures user proportions (tracker distances) vs avatar proportions
+            // (bone distances) to scale tracker positions to match avatar limb lengths.
+            if (hasHead && hasHip)
+            {
+                float userTorso = Vector3.Distance(headTrackerWPos, hipTrackerWPos);
+                float avatarTorso = Vector3.Distance(headBoneWPos, hipBoneWPos);
+                float torsoScale = (userTorso > 0.01f) ? (avatarTorso / userTorso) : 1f;
+
+                float legScaleL = 1f;
+                float legScaleR = 1f;
+
+                if (hasFootL)
+                {
+                    float userLegL = Vector3.Distance(hipTrackerWPos, footLTrackerWPos);
+                    float avatarLegL = Vector3.Distance(hipBoneWPos, footLBoneWPos);
+                    legScaleL = (userLegL > 0.01f) ? (avatarLegL / userLegL) : 1f;
+                }
+
+                if (hasFootR)
+                {
+                    float userLegR = Vector3.Distance(hipTrackerWPos, footRTrackerWPos);
+                    float avatarLegR = Vector3.Distance(hipBoneWPos, footRBoneWPos);
+                    legScaleR = (userLegR > 0.01f) ? (avatarLegR / userLegR) : 1f;
+                }
+
+                // Create or reuse the proportion scaler on this GameObject
+                var scaler = gameObject.GetComponent<MocapProportionScaler>();
+                if (scaler == null)
+                    scaler = gameObject.AddComponent<MocapProportionScaler>();
+
+                scaler.HeadTracker = headTrackerRef;
+                scaler.HipTracker = hipTrackerRef;
+                scaler.FootLTracker = footLTrackerRef;
+                scaler.FootRTracker = footRTrackerRef;
+                scaler.HipOffset = hipOffsetRef;
+                scaler.FootLOffset = footLOffsetRef;
+                scaler.FootROffset = footROffsetRef;
+                scaler.TorsoScale = torsoScale;
+                scaler.LegScaleL = legScaleL;
+                scaler.LegScaleR = legScaleR;
+
+                Debug.Log($"[MocapCalibrator] Proportion scaler configured:\n" +
+                          $"  Torso - User: {userTorso:F3}m, Avatar: {avatarTorso:F3}m, Scale: {torsoScale:F3}\n" +
+                          $"  LegL  - Scale: {legScaleL:F3}\n" +
+                          $"  LegR  - Scale: {legScaleR:F3}");
+            }
+            else
+            {
+                Debug.LogWarning("[MocapCalibrator] Could not compute proportions - missing head or hip tracker.");
+            }
+
+            // Restore animator state
             RestoreComponents();
+
+            // Enable VRIK now that calibration is complete
+            if (_currentRequest.EnableVRIKAfterCalibration && _vrikComponent != null)
+            {
+                ((Behaviour)_vrikComponent).enabled = true;
+                Debug.Log("[MocapCalibrator] VRIK enabled after calibration.");
+            }
 
             // Done
             SetState(CalibrationState.Completed);
@@ -623,12 +731,6 @@ namespace MocapTools
         private void RestoreComponents()
         {
             if (_currentRequest == null) return;
-
-            if (_currentRequest.DisableVRIKDuringCalibration && _vrikComponent != null)
-            {
-                ((Behaviour)_vrikComponent).enabled = _vrikWasEnabled;
-                Debug.Log("[MocapCalibrator] VRIK restored.");
-            }
 
             if (_currentRequest.FreezeAnimatorDuringCalibration && _animator != null)
             {

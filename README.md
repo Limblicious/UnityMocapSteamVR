@@ -66,30 +66,32 @@ Calibrates VR tracker-to-bone offsets by having the user hold a T-pose. Aligns t
 
 ### How It Works
 
-1. The user holds a T-pose during a countdown.
+1. VRIK should be **disabled before calibration**. The user holds a T-pose during a countdown.
 2. Tracker and bone positions/rotations are sampled over a configurable window.
 3. **Head-anchored yaw alignment**: the `TrackingRoot` transform is repositioned and yaw-rotated so the head tracker lines up with the avatar's Head bone. Only yaw (Y-axis rotation) is applied to TrackingRoot to avoid tilting the entire tracking space -- any head pitch/roll during the T-pose is handled per-tracker instead.
-4. For each tracker (including head), a local offset (`*_Off` child transform) is computed from the sampled data so that the offset transform's world pose matches the corresponding avatar bone. Offsets are derived entirely from the averaged sample window, not from live tracker transforms, eliminating drift between the sampling and application phases.
-5. VRIK targets should point to these `*_Off` transforms instead of raw tracked objects.
+4. **Proportion scaling**: the calibrator measures the user's body proportions (head-to-hip, hip-to-foot distances from tracker positions) and the avatar's proportions (bone-to-bone distances). Per-limb scale factors are computed so that tracker positions are mapped to the avatar's limb lengths at runtime, regardless of the user's actual body size.
+5. For each tracker, a local rotation offset (`*_Off` child transform) is computed so the offset transform's orientation matches the corresponding avatar bone. **Hands, hips, and feet get zero position offsets** -- hand trackers are used directly for their high accuracy, while hip and foot positions are handled by the proportion scaler at runtime.
+6. A `MocapProportionScaler` component is created to run every frame (before VRIK). It scales the head-to-hip vector by the torso ratio and hip-to-foot vectors by the leg ratios, positioning the hip and foot offset children at proportion-corrected locations.
+7. VRIK is **automatically enabled** after calibration completes. VRIK targets should point to the `*_Off` transforms instead of raw tracked objects.
 
 ### Usage
 
-1. Enter Play Mode with VR headset and trackers active.
+1. Enter Play Mode with VR headset and trackers active. **Ensure VRIK is disabled.**
 2. Open **Tools > Mocap > Calibrate**.
 3. Assign **Character Root** (GameObject with Humanoid Animator) and **Tracking Root** (parent of `Tracked_Head`, `Tracked_HandL`, etc.).
 4. Click **Calibrate** and hold a T-pose for the countdown duration.
-5. Results are displayed with per-tracker position/rotation offsets.
+5. Results are displayed with per-tracker rotation offsets and proportion scale factors. VRIK is enabled automatically.
 
 ### Default Tracker Mappings
 
 | Tracked Object | Offset Child | Avatar Bone | Notes |
 |----------------|-------------|-------------|-------|
 | `Tracked_Head` | `Head_Off` | Head | Yaw anchor; offset handles remaining pitch/roll |
-| `Tracked_HandL` | `HandL_Off` | LeftHand | |
-| `Tracked_HandR` | `HandR_Off` | RightHand | |
-| `Tracked_Hips` | `Pelvis_Off` | Hips | Also accepts `Tracked_Waist` |
-| `Tracked_FootL` | `FootL_Off` | LeftFoot | Foot rotation toggle |
-| `Tracked_FootR` | `FootR_Off` | RightFoot | Foot rotation toggle |
+| `Tracked_HandL` | `HandL_Off` | LeftHand | Zero position offset (tracker-direct) |
+| `Tracked_HandR` | `HandR_Off` | RightHand | Zero position offset (tracker-direct) |
+| `Tracked_Hips` | `Pelvis_Off` | Hips | Also accepts `Tracked_Waist`; position via proportion scaler |
+| `Tracked_FootL` | `FootL_Off` | LeftFoot | Position via proportion scaler; foot rotation toggle |
+| `Tracked_FootR` | `FootR_Off` | RightFoot | Position via proportion scaler; foot rotation toggle |
 | `Tracked_ElbowL` | `ElbowL_Off` | LeftLowerArm | Position only |
 | `Tracked_ElbowR` | `ElbowR_Off` | RightLowerArm | Position only |
 
@@ -97,7 +99,7 @@ Calibrates VR tracker-to-bone offsets by having the user hold a T-pose. Aligns t
 
 - **Countdown** (1-10s) &mdash; time to prepare and hold T-pose.
 - **Sample Duration** (0.1-2s) &mdash; how long poses are sampled after countdown.
-- **Disable VRIK During Calibration** &mdash; temporarily disables VRIK so the avatar stays in its reference pose. Recommended on.
+- **Enable VRIK After Calibration** &mdash; automatically enables VRIK after calibration completes. VRIK should be disabled before starting calibration. Recommended on.
 - **Freeze Animator** &mdash; disables the Animator component during calibration.
 - **Apply Rotation Offsets** &mdash; applies rotation offsets for head, hands, and pelvis.
 - **Apply Foot Rotation** &mdash; separate toggle for foot rotation offsets.
@@ -107,7 +109,7 @@ Calibrates VR tracker-to-bone offsets by having the user hold a T-pose. Aligns t
 The calibrator detects **FinalIK** components (`VRIK`, `FullBodyBipedIK`) by type name string only, not by direct `using` import. This means:
 
 - The tool compiles and runs even if FinalIK is not installed.
-- When FinalIK is present, it finds and temporarily disables VRIK during calibration, then re-enables it afterward.
+- When FinalIK is present and "Enable VRIK After Calibration" is on, it enables VRIK after calibration completes. VRIK should be disabled before starting calibration.
 
 Tracker naming follows **SteamVR** conventions (`Tracked_Head`, `Tracked_HandL`, etc.), but the tool has no compile-time dependency on SteamVR.
 
@@ -116,7 +118,8 @@ Tracker naming follows **SteamVR** conventions (`Tracked_Head`, `Tracked_HandL`,
 | File | Type | Description |
 |------|------|-------------|
 | `Editor/MocapCalibratorWindow.cs` | Editor Window | UI for setup, settings, mapping preview, calibration control, and results display. |
-| `Scripts/MocapCalibratorRunner.cs` | Runtime Component | Coroutine-based calibration engine. Handles countdown, sampling, TrackingRoot alignment, and offset computation. |
+| `Scripts/MocapCalibratorRunner.cs` | Runtime Component | Coroutine-based calibration engine. Handles countdown, sampling, TrackingRoot alignment, proportion measurement, and offset computation. |
+| `Scripts/MocapProportionScaler.cs` | Runtime Component | Per-frame proportion scaling. Positions hip and foot offset children at scaled locations to match avatar limb lengths. Runs at `DefaultExecutionOrder(-100)` (before VRIK). |
 
 ---
 
@@ -175,6 +178,7 @@ Assets/Tools/MocapRecorder/
     ├── MocapSkeletonRecorder.cs        # Transform-mode recording engine
     ├── MocapHumanoidRecorder.cs        # Humanoid-mode recording engine
     ├── MocapCalibratorRunner.cs        # Calibration engine
+    ├── MocapProportionScaler.cs        # Runtime proportion scaling
     └── AnimationClipSimplifier.cs      # Curve simplification utility
 ```
 
