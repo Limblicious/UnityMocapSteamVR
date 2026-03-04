@@ -424,12 +424,12 @@ namespace MocapTools
 
             // Proportion scaling: collect tracker and bone world positions during
             // the offset loop, then compute per-limb scale factors after.
-            Vector3 headTrackerWPos = Vector3.zero, hipTrackerWPos = Vector3.zero;
+            Vector3 hipTrackerWPos = Vector3.zero;
             Vector3 footLTrackerWPos = Vector3.zero, footRTrackerWPos = Vector3.zero;
-            Vector3 headBoneWPos = Vector3.zero, hipBoneWPos = Vector3.zero;
+            Vector3 hipBoneWPos = Vector3.zero;
             Vector3 footLBoneWPos = Vector3.zero, footRBoneWPos = Vector3.zero;
-            bool hasHead = false, hasHip = false, hasFootL = false, hasFootR = false;
-            Transform headTrackerRef = null, hipTrackerRef = null;
+            bool hasHip = false, hasFootL = false, hasFootR = false;
+            Transform hipTrackerRef = null;
             Transform footLTrackerRef = null, footRTrackerRef = null;
             Transform hipOffsetRef = null, footLOffsetRef = null, footROffsetRef = null;
 
@@ -481,14 +481,7 @@ namespace MocapTools
                 bool isFoot = (mapping.Bone == HumanBodyBones.LeftFoot ||
                                mapping.Bone == HumanBodyBones.RightFoot);
 
-                if (mapping.Bone == HumanBodyBones.Head)
-                {
-                    headTrackerWPos = expectedWorldPos;
-                    headBoneWPos = avgBonePos;
-                    headTrackerRef = mapping.TrackerTransform;
-                    hasHead = true;
-                }
-                else if (isHip)
+                if (isHip)
                 {
                     hipTrackerWPos = expectedWorldPos;
                     hipBoneWPos = avgBonePos;
@@ -544,15 +537,15 @@ namespace MocapTools
                           $"localPos={localPos}, localRot={localRot.eulerAngles}");
             }
 
-            // Step 3: Compute proportion scale factors and create runtime scaler.
-            // Measures user proportions (tracker distances) vs avatar proportions
-            // (bone distances) to scale tracker positions to match avatar limb lengths.
-            if (hasHead && hasHip)
+            // Step 3: Create runtime proportion scaler.
+            // Hip target follows the dedicated hip tracker directly (no head coupling).
+            // Feet are scaled relative to the raw hip tracker position.
+            // Scale factors measure user leg length vs avatar leg length at T-pose.
+            // TorsoScale is intentionally removed: the old head->hip torso vector caused
+            // the hip VRIK target to whip when the head moved. With a dedicated hip tracker,
+            // the tracker is ground truth and is used directly.
+            if (hasHip)
             {
-                float userTorso = Vector3.Distance(headTrackerWPos, hipTrackerWPos);
-                float avatarTorso = Vector3.Distance(headBoneWPos, hipBoneWPos);
-                float torsoScale = (userTorso > 0.01f) ? (avatarTorso / userTorso) : 1f;
-
                 float legScaleL = 1f;
                 float legScaleR = 1f;
 
@@ -575,25 +568,23 @@ namespace MocapTools
                 if (scaler == null)
                     scaler = gameObject.AddComponent<MocapProportionScaler>();
 
-                scaler.HeadTracker = headTrackerRef;
                 scaler.HipTracker = hipTrackerRef;
                 scaler.FootLTracker = footLTrackerRef;
                 scaler.FootRTracker = footRTrackerRef;
                 scaler.HipOffset = hipOffsetRef;
                 scaler.FootLOffset = footLOffsetRef;
                 scaler.FootROffset = footROffsetRef;
-                scaler.TorsoScale = torsoScale;
                 scaler.LegScaleL = legScaleL;
                 scaler.LegScaleR = legScaleR;
 
                 Debug.Log($"[MocapCalibrator] Proportion scaler configured:\n" +
-                          $"  Torso - User: {userTorso:F3}m, Avatar: {avatarTorso:F3}m, Scale: {torsoScale:F3}\n" +
-                          $"  LegL  - Scale: {legScaleL:F3}\n" +
-                          $"  LegR  - Scale: {legScaleR:F3}");
+                          $"  Hip: tracker direct (no head coupling)\n" +
+                          $"  LegL - Scale: {legScaleL:F3}\n" +
+                          $"  LegR - Scale: {legScaleR:F3}");
             }
             else
             {
-                Debug.LogWarning("[MocapCalibrator] Could not compute proportions - missing head or hip tracker.");
+                Debug.LogWarning("[MocapCalibrator] Could not configure proportion scaler - hip tracker not found.");
             }
 
             // Restore animator state

@@ -3,20 +3,33 @@ using UnityEngine;
 namespace MocapTools
 {
     /// <summary>
-    /// Runtime component that scales tracker-to-offset-child positions each frame
-    /// to match avatar proportions. Created and configured by MocapCalibratorRunner.
+    /// Runtime component that positions VRIK target offset children each frame
+    /// based on live tracker positions, with optional per-limb proportion scaling.
     ///
-    /// Handles the case where the user's body proportions differ from the avatar's.
-    /// Positions are scaled per-limb-chain: head->hip (torso) and hip->feet (legs).
-    /// Hands are not scaled (hand trackers are used directly).
+    /// Hip target:
+    ///   Follows HipTracker directly every frame. Head position has NO influence
+    ///   over hip placement. The old head-anchored torso-scaling approach caused
+    ///   the hip VRIK target to whip in an arc whenever the head moved or rotated.
+    ///   With a dedicated hip tracker (e.g. Vive Tracker on pelvis), the tracker
+    ///   is the ground truth — use it directly.
+    ///
+    /// Foot targets:
+    ///   Scale the hip->foot vector by LegScale, anchored from the raw HipTracker
+    ///   world position. If LegScale = 1.0 (user and avatar have matching leg lengths),
+    ///   feet follow trackers exactly. Scale > 1.0 when avatar legs are longer than
+    ///   the user's; scale < 1.0 when shorter.
+    ///
+    /// Hands are not handled here — hand controllers are used directly as VRIK targets.
     /// </summary>
     [DefaultExecutionOrder(-100)] // Run before VRIK in LateUpdate
     public class MocapProportionScaler : MonoBehaviour
     {
         [Header("Tracker References")]
-        public Transform HeadTracker;
+        [Tooltip("Dedicated hip/pelvis tracker. Hip VRIK target follows this directly.")]
         public Transform HipTracker;
+        [Tooltip("Left foot tracker.")]
         public Transform FootLTracker;
+        [Tooltip("Right foot tracker.")]
         public Transform FootRTracker;
 
         [Header("Offset Children (VRIK Targets)")]
@@ -24,40 +37,37 @@ namespace MocapTools
         public Transform FootLOffset;
         public Transform FootROffset;
 
-        [Header("Scale Factors")]
-        public float TorsoScale = 1f;
+        [Header("Leg Scale Factors")]
+        [Tooltip("Scales the hip->left foot vector. 1.0 = tracker direct. " +
+                 "Increase if avatar left leg is longer than yours; decrease if shorter.")]
         public float LegScaleL = 1f;
+        [Tooltip("Scales the hip->right foot vector. 1.0 = tracker direct.")]
         public float LegScaleR = 1f;
 
         private void LateUpdate()
         {
-            if (HeadTracker == null) return;
-
-            Vector3 headPos = HeadTracker.position;
-
-            // Scale hip position: head->hip vector scaled to avatar torso length
+            // Hip: follow the dedicated tracker directly.
+            // Head position intentionally NOT used here — it caused hip whipping.
             if (HipTracker != null && HipOffset != null)
             {
-                Vector3 hipVector = HipTracker.position - headPos;
-                HipOffset.position = headPos + hipVector * TorsoScale;
+                HipOffset.position = HipTracker.position;
             }
 
-            // Reference positions for feet
-            Vector3 hipTrackerPos = (HipTracker != null) ? HipTracker.position : headPos;
-            Vector3 scaledHipPos = (HipOffset != null) ? HipOffset.position : hipTrackerPos;
+            // Feet: scale hip->foot vector from the raw hip tracker world position.
+            // Anchoring from HipTracker (not from any head-derived position) keeps
+            // feet stable even during aggressive head movement.
+            Vector3 hipAnchorPos = (HipTracker != null) ? HipTracker.position : Vector3.zero;
 
-            // Scale left foot position: hip->foot vector scaled to avatar leg length
             if (FootLTracker != null && FootLOffset != null)
             {
-                Vector3 footVector = FootLTracker.position - hipTrackerPos;
-                FootLOffset.position = scaledHipPos + footVector * LegScaleL;
+                Vector3 footVector = FootLTracker.position - hipAnchorPos;
+                FootLOffset.position = hipAnchorPos + footVector * LegScaleL;
             }
 
-            // Scale right foot position
             if (FootRTracker != null && FootROffset != null)
             {
-                Vector3 footVector = FootRTracker.position - hipTrackerPos;
-                FootROffset.position = scaledHipPos + footVector * LegScaleR;
+                Vector3 footVector = FootRTracker.position - hipAnchorPos;
+                FootROffset.position = hipAnchorPos + footVector * LegScaleR;
             }
         }
     }
