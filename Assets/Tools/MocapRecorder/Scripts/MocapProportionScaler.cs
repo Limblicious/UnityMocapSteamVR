@@ -44,22 +44,13 @@ namespace MocapTools
         [Tooltip("Scales the hip->right foot vector. 1.0 = tracker direct.")]
         public float LegScaleR = 1f;
 
-        [Header("Hip Vertical Compensation")]
-        [Tooltip("Vertical offset applied to the hip target every frame: avatarHipBoneY - userHipTrackerY " +
-                 "measured at T-pose during calibration. Corrects torso compression caused by height " +
-                 "differences between user and avatar without reintroducing head coupling. " +
-                 "Set automatically by MocapCalibratorRunner. Adjust manually if needed.")]
-        public float HipVerticalOffset = 0f;
-
         private void LateUpdate()
         {
-            // Hip: follow the dedicated tracker directly + Y-only vertical compensation.
-            // HipVerticalOffset bridges the height difference between user and avatar
-            // so VRIK does not have to compress the spine to reconcile them.
-            // Head position is intentionally NOT used — it caused hip whipping.
+            // Hip: follow the dedicated tracker directly.
+            // Head position intentionally NOT used here — it caused hip whipping.
             if (HipTracker != null && HipOffset != null)
             {
-                HipOffset.position = HipTracker.position + new Vector3(0f, HipVerticalOffset, 0f);
+                HipOffset.position = HipTracker.position;
             }
 
             // Feet: scale hip->foot vector from the raw hip tracker world position.

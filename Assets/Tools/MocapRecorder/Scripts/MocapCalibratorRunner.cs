@@ -568,11 +568,6 @@ namespace MocapTools
                 if (scaler == null)
                     scaler = gameObject.AddComponent<MocapProportionScaler>();
 
-                // Hip vertical compensation: offset avatar hip Y - user hip tracker Y at T-pose.
-                // Corrects torso compression when user and avatar have different torso heights.
-                // Y-only — no horizontal component, no head coupling.
-                float hipVerticalOffset = hipBoneWPos.y - hipTrackerWPos.y;
-
                 scaler.HipTracker = hipTrackerRef;
                 scaler.FootLTracker = footLTrackerRef;
                 scaler.FootRTracker = footRTrackerRef;
@@ -581,11 +576,9 @@ namespace MocapTools
                 scaler.FootROffset = footROffsetRef;
                 scaler.LegScaleL = legScaleL;
                 scaler.LegScaleR = legScaleR;
-                scaler.HipVerticalOffset = hipVerticalOffset;
 
                 Debug.Log($"[MocapCalibrator] Proportion scaler configured:\n" +
-                          $"  Hip: tracker direct + Y offset (no head coupling)\n" +
-                          $"  HipVerticalOffset: {hipVerticalOffset:F4}m (avatar hip Y - user hip tracker Y)\n" +
+                          $"  Hip: tracker direct (no head coupling)\n" +
                           $"  LegL - Scale: {legScaleL:F3}\n" +
                           $"  LegR - Scale: {legScaleR:F3}");
             }
