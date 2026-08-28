@@ -34,6 +34,22 @@ namespace MocapTools
         private AnimationCurve _rootQX, _rootQY, _rootQZ, _rootQW;
         private float _currentTime;
 
+        // Adaptive sampling
+        private bool _enableAdaptiveSampling;
+        private float _adaptiveTolerance;
+        private float _maxKeyIntervalSeconds;
+
+        private struct AdaptiveState
+        {
+            public float lastValue;
+            public float lastVelocity;
+            public float lastKeyTime;
+            public bool hasKey;
+        }
+
+        private AdaptiveState[] _muscleState;
+        private AdaptiveState[] _rootState;
+
         // Initial pose for relative root motion
         private Vector3 _initialRootPosition;
         private Quaternion _initialRootRotation;
@@ -70,7 +86,11 @@ namespace MocapTools
         /// <param name="fps">Target framerate for recording (deterministic sampling).</param>
         /// <param name="startDelaySeconds">Countdown before recording starts.</param>
         /// <param name="recordRootMotion">Whether to record RootT/RootQ curves for root motion.</param>
-        public void BeginRecordingHumanoid(Animator animator, int fps, float startDelaySeconds, bool recordRootMotion)
+        /// <param name="enableAdaptive">Enable velocity-adaptive keyframe reduction.</param>
+        /// <param name="adaptiveTolerance">Max error before recording a new keyframe.</param>
+        /// <param name="maxKeyInterval">Max seconds between forced keyframes.</param>
+        public void BeginRecordingHumanoid(Animator animator, int fps, float startDelaySeconds,
+            bool recordRootMotion, bool enableAdaptive, float adaptiveTolerance, float maxKeyInterval)
         {
             if (_isRecording || _isCountingDown)
             {
@@ -105,6 +125,9 @@ namespace MocapTools
             _animator = animator;
             _targetFps = Mathf.Max(1, fps);
             _recordRootMotion = recordRootMotion;
+            _enableAdaptiveSampling = enableAdaptive;
+            _adaptiveTolerance = Mathf.Max(0.00001f, adaptiveTolerance);
+            _maxKeyIntervalSeconds = Mathf.Max(0.01f, maxKeyInterval);
 
             if (startDelaySeconds > 0f)
             {
@@ -155,6 +178,13 @@ namespace MocapTools
             _initialRootPosition = _humanPose.bodyPosition;
             _initialRootRotation = _humanPose.bodyRotation;
 
+            // Initialize adaptive sampling state
+            if (_enableAdaptiveSampling)
+            {
+                _muscleState = new AdaptiveState[HumanTrait.MuscleCount];
+                _rootState = _recordRootMotion ? new AdaptiveState[7] : null;
+            }
+
             // Reset time accumulator
             _currentTime = 0f;
 
@@ -165,7 +195,8 @@ namespace MocapTools
             _recordingStartTime = Time.time;
 
             Debug.Log($"[MocapHumanoid] Recording started at {_targetFps} FPS. " +
-                      $"Animator: {_animator.name}, Muscles: {muscleCount}, RootMotion: {_recordRootMotion}");
+                      $"Animator: {_animator.name}, Muscles: {muscleCount}, RootMotion: {_recordRootMotion}" +
+                      (_enableAdaptiveSampling ? $", Adaptive: tol={_adaptiveTolerance:F4} maxInt={_maxKeyIntervalSeconds:F2}s" : ""));
             OnRecordingStarted?.Invoke();
         }
 
@@ -173,35 +204,112 @@ namespace MocapTools
         {
             if (_poseHandler == null) return;
 
-            // Get current human pose
             _poseHandler.GetHumanPose(ref _humanPose);
 
-            // Record muscle values
+            if (_enableAdaptiveSampling)
+            {
+                RecordMusclesAdaptive();
+                if (_recordRootMotion)
+                    RecordRootMotionAdaptive();
+            }
+            else
+            {
+                RecordMusclesAll();
+                if (_recordRootMotion)
+                    RecordRootMotionAll();
+            }
+        }
+
+        private void RecordMusclesAll()
+        {
             for (int i = 0; i < HumanTrait.MuscleCount; i++)
             {
                 if (_muscleCurves.TryGetValue(i, out AnimationCurve curve))
-                {
                     curve.AddKey(_currentTime, _humanPose.muscles[i]);
-                }
             }
+        }
 
-            // Record root motion if enabled
-            if (_recordRootMotion)
+        private void RecordRootMotionAll()
+        {
+            Vector3 relativePos = _humanPose.bodyPosition - _initialRootPosition;
+            Quaternion relativeRot = Quaternion.Inverse(_initialRootRotation) * _humanPose.bodyRotation;
+            _rootTX.AddKey(_currentTime, relativePos.x);
+            _rootTY.AddKey(_currentTime, relativePos.y);
+            _rootTZ.AddKey(_currentTime, relativePos.z);
+            _rootQX.AddKey(_currentTime, relativeRot.x);
+            _rootQY.AddKey(_currentTime, relativeRot.y);
+            _rootQZ.AddKey(_currentTime, relativeRot.z);
+            _rootQW.AddKey(_currentTime, relativeRot.w);
+        }
+
+        private void RecordMusclesAdaptive()
+        {
+            for (int i = 0; i < HumanTrait.MuscleCount; i++)
             {
-                // Calculate relative position (relative to initial position)
-                Vector3 relativePos = _humanPose.bodyPosition - _initialRootPosition;
+                if (!_muscleCurves.TryGetValue(i, out AnimationCurve curve)) continue;
+                float actual = _humanPose.muscles[i];
+                ref AdaptiveState state = ref _muscleState[i];
 
-                // Calculate relative rotation (relative to initial rotation)
-                Quaternion relativeRot = Quaternion.Inverse(_initialRootRotation) * _humanPose.bodyRotation;
-
-                _rootTX.AddKey(_currentTime, relativePos.x);
-                _rootTY.AddKey(_currentTime, relativePos.y);
-                _rootTZ.AddKey(_currentTime, relativePos.z);
-                _rootQX.AddKey(_currentTime, relativeRot.x);
-                _rootQY.AddKey(_currentTime, relativeRot.y);
-                _rootQZ.AddKey(_currentTime, relativeRot.z);
-                _rootQW.AddKey(_currentTime, relativeRot.w);
+                if (ShouldRecordAdaptive(actual, ref state))
+                    curve.AddKey(_currentTime, actual);
             }
+        }
+
+        private void RecordRootMotionAdaptive()
+        {
+            Vector3 relativePos = _humanPose.bodyPosition - _initialRootPosition;
+            Quaternion relativeRot = Quaternion.Inverse(_initialRootRotation) * _humanPose.bodyRotation;
+
+            float[] rootValues = {
+                relativePos.x, relativePos.y, relativePos.z,
+                relativeRot.x, relativeRot.y, relativeRot.z, relativeRot.w
+            };
+
+            var curves = new[] { _rootTX, _rootTY, _rootTZ, _rootQX, _rootQY, _rootQZ, _rootQW };
+
+            for (int i = 0; i < 7; i++)
+            {
+                float actual = rootValues[i];
+                ref AdaptiveState state = ref _rootState[i];
+                if (ShouldRecordAdaptive(actual, ref state))
+                    curves[i].AddKey(_currentTime, actual);
+            }
+        }
+
+        private bool ShouldRecordAdaptive(float actualValue, ref AdaptiveState state)
+        {
+            if (!state.hasKey)
+            {
+                state.lastValue = actualValue;
+                state.lastKeyTime = _currentTime;
+                state.hasKey = true;
+                return true;
+            }
+
+            float timeSinceKey = _currentTime - state.lastKeyTime;
+            if (timeSinceKey >= _maxKeyIntervalSeconds)
+            {
+                float dt = _currentTime - state.lastKeyTime;
+                state.lastVelocity = dt > 0.00001f ? (actualValue - state.lastValue) / dt : 0f;
+                state.lastValue = actualValue;
+                state.lastKeyTime = _currentTime;
+                return true;
+            }
+
+            float deltaTime = _currentTime - state.lastKeyTime;
+            float predicted = state.lastValue + state.lastVelocity * deltaTime;
+            float error = Mathf.Abs(actualValue - predicted);
+
+            if (error > _adaptiveTolerance)
+            {
+                float dt = _currentTime - state.lastKeyTime;
+                state.lastVelocity = dt > 0.00001f ? (actualValue - state.lastValue) / dt : 0f;
+                state.lastValue = actualValue;
+                state.lastKeyTime = _currentTime;
+                return true;
+            }
+
+            return false;
         }
 
         /// <summary>

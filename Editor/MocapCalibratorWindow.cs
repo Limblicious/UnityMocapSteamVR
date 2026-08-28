@@ -659,7 +659,6 @@ namespace MocapTools
 
             // Use runner to validate (or create temporary one)
             var runner = _runner;
-            bool createdTemp = false;
 
             if (runner == null && Application.isPlaying)
             {

@@ -1,6 +1,16 @@
 # MoCap Tools for Unity
 
-A suite of Unity Editor tools for VR motion capture recording, tracker calibration, and animation clip post-processing. All tools live under `Assets/Tools/MocapRecorder/` and are accessed from the **Tools > Mocap** menu.
+A suite of Unity Editor tools for VR motion capture recording, tracker calibration, and animation clip post-processing, shipped as the UPM package `com.limblicious.mocap`. All tools are accessed from the **Tools > Mocap** menu.
+
+## Installing
+
+Reference this repository as an embedded package from a Unity project (`Packages/manifest.json`):
+
+```json
+"com.limblicious.mocap": "file:com.limblicious.mocap"
+```
+
+(or `"com.limblicious.mocap": "https://github.com/Limblicious/UnityMocapSteamVR.git#v0.1.0"` for a git dependency). The package is editor-tooling: recorder/calibrator runs in editor Play Mode, and the recorder scripts are in the Editor assembly by design. NUN-TPS consumes this package as an embedded `file:` reference; keep this repository in sync with that copy.
 
 ## Tools Overview
 
@@ -39,6 +49,7 @@ Records motion from a character in Play Mode into a `.anim` AnimationClip. Suppo
 - **Clip Name** &mdash; leave empty for auto-generated timestamped names (`Take_YYYYMMDD_HHmmss`).
 - **Output Folder** &mdash; default `Assets/Captures/Raw`.
 - **Record Root Motion** (Humanoid only) &mdash; records `RootT`/`RootQ` curves for root motion. Usually off for in-place animations.
+- **Adaptive Sampling** &mdash; only records keyframes when bone velocity changes, reducing keyframe density by 70-90%. Configurable tolerance and max interval between forced keyframes.
 - **Auto Export FBX** (Transform only) &mdash; optional FBX export via reflection on the `com.unity.formats.fbx` package. No hard dependency; gracefully skips if the package is not installed.
 
 ### Bone Root Auto-Detection (Transform Mode)
@@ -55,8 +66,8 @@ When you assign a Character Root, the tool automatically resolves the bone hiera
 | File | Type | Description |
 |------|------|-------------|
 | `Editor/MocapTakeRecorderWindow.cs` | Editor Window | Main UI. Manages settings, arm/stop controls, clip saving, FBX export. |
-| `Scripts/MocapSkeletonRecorder.cs` | Runtime Component | Transform mode worker. Uses `GameObjectRecorder` to capture bone transforms in `LateUpdate` at `DefaultExecutionOrder(10000)` (post-IK). |
-| `Scripts/MocapHumanoidRecorder.cs` | Runtime Component | Humanoid mode worker. Uses `HumanPoseHandler` to capture all muscle curves in `LateUpdate` at `DefaultExecutionOrder(10000)`. |
+| `Editor/MocapSkeletonRecorder.cs` | Editor Component | Transform mode worker. Uses `GameObjectRecorder` to capture bone transforms in `LateUpdate` at `DefaultExecutionOrder(10000)` (post-IK). |
+| `Editor/MocapHumanoidRecorder.cs` | Editor Component | Humanoid mode worker. Uses `HumanPoseHandler` to capture all muscle curves in `LateUpdate` at `DefaultExecutionOrder(10000)`. |
 
 ---
 
@@ -118,8 +129,8 @@ Tracker naming follows **SteamVR** conventions (`Tracked_Head`, `Tracked_HandL`,
 | File | Type | Description |
 |------|------|-------------|
 | `Editor/MocapCalibratorWindow.cs` | Editor Window | UI for setup, settings, mapping preview, calibration control, and results display. |
-| `Scripts/MocapCalibratorRunner.cs` | Runtime Component | Coroutine-based calibration engine. Handles countdown, sampling, TrackingRoot alignment, proportion measurement, and offset computation. |
-| `Scripts/MocapProportionScaler.cs` | Runtime Component | Per-frame proportion scaling. Positions hip and foot offset children at scaled locations to match avatar limb lengths. Runs at `DefaultExecutionOrder(-100)` (before VRIK). |
+| `Runtime/MocapCalibratorRunner.cs` | Runtime Component | Coroutine-based calibration engine. Handles countdown, sampling, TrackingRoot alignment, proportion measurement, and offset computation. |
+| `Runtime/MocapProportionScaler.cs` | Runtime Component | Per-frame proportion scaling. Positions hip and foot offset children at scaled locations to match avatar limb lengths. Runs at `DefaultExecutionOrder(-100)` (before VRIK). |
 
 ---
 
@@ -162,27 +173,30 @@ The simplifier uses a deterministic key-reduction algorithm: for each intermedia
 | File | Type | Description |
 |------|------|-------------|
 | `Editor/AnimationClipSimplifierWindow.cs` | Editor Window | UI for source selection, mode detection, tolerance controls, statistics, and output. |
-| `Scripts/AnimationClipSimplifier.cs` | Static Utility | Pure curve simplification logic. No Editor dependency; usable at runtime. Provides `SimplifyCurve`, `SimplifyCurveWithTangents`, and batch operations. |
+| `Runtime/AnimationClipSimplifier.cs` | Static Utility | Pure curve simplification logic. No Editor dependency; usable at runtime. Provides `SimplifyCurve`, `SimplifyCurveWithTangents`, and batch operations. |
 
 ---
 
-## Project Structure
+## Package Structure
 
 ```
-Assets/Tools/MocapRecorder/
-├── Editor/
-│   ├── MocapTakeRecorderWindow.cs      # Take Recorder UI
-│   ├── MocapCalibratorWindow.cs        # Calibrator UI
-│   └── AnimationClipSimplifierWindow.cs # Clip Simplifier UI
-└── Scripts/
-    ├── MocapSkeletonRecorder.cs        # Transform-mode recording engine
-    ├── MocapHumanoidRecorder.cs        # Humanoid-mode recording engine
-    ├── MocapCalibratorRunner.cs        # Calibration engine
-    ├── MocapProportionScaler.cs        # Runtime proportion scaling
-    └── AnimationClipSimplifier.cs      # Curve simplification utility
+com.limblicious.mocap/
+├── package.json
+├── Runtime/
+│   ├── Limblicious.Mocap.Runtime.asmdef
+│   ├── MocapCalibratorRunner.cs          # Calibration engine
+│   ├── MocapProportionScaler.cs          # Runtime proportion scaling
+│   └── AnimationClipSimplifier.cs        # Curve simplification utility
+└── Editor/
+    ├── Limblicious.Mocap.Editor.asmdef
+    ├── MocapTakeRecorderWindow.cs        # Take Recorder UI
+    ├── MocapSkeletonRecorder.cs          # Transform-mode recording engine
+    ├── MocapHumanoidRecorder.cs          # Humanoid-mode recording engine
+    ├── MocapCalibratorWindow.cs          # Calibrator UI
+    └── AnimationClipSimplifierWindow.cs  # Clip Simplifier UI
 ```
 
-All scripts are in the `MocapTools` namespace.
+All scripts are in the `MocapTools` namespace. `MocapSkeletonRecorder` and `MocapHumanoidRecorder` reference `UnityEditor` APIs, so they live in the Editor assembly despite being Play Mode components.
 
 ## Dependencies
 

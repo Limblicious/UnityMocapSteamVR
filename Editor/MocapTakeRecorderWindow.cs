@@ -36,6 +36,9 @@ namespace MocapTools
         // Record mode settings
         private RecordMode _recordMode = RecordMode.Transform;
         private bool _recordRootMotion = false;
+        private bool _enableAdaptiveSampling = true;
+        private float _adaptiveTolerance = 0.005f;
+        private float _adaptiveMaxInterval = 0.5f;
         private Animator _resolvedAnimator;  // Auto-detected animator for humanoid mode
 
         // Runtime state
@@ -64,6 +67,9 @@ namespace MocapTools
         private const string PREFS_AUTO_FBX = "MocapRecorder_AutoFbx";
         private const string PREFS_RECORD_MODE = "MocapRecorder_RecordMode";
         private const string PREFS_ROOT_MOTION = "MocapRecorder_RootMotion";
+        private const string PREFS_ADAPTIVE_SAMPLING = "MocapRecorder_AdaptiveSampling";
+        private const string PREFS_ADAPTIVE_TOLERANCE = "MocapRecorder_AdaptiveTolerance";
+        private const string PREFS_ADAPTIVE_INTERVAL = "MocapRecorder_AdaptiveMaxInterval";
 
         [MenuItem("Tools/Mocap/Take Recorder")]
         public static void ShowWindow()
@@ -281,6 +287,24 @@ namespace MocapTools
                     _recordRootMotion = EditorGUILayout.Toggle(
                         new GUIContent("Record Root Motion", "Record RootT/RootQ curves for root motion. Usually OFF for in-place animations."),
                         _recordRootMotion);
+
+                    EditorGUILayout.Space(3);
+
+                    _enableAdaptiveSampling = EditorGUILayout.Toggle(
+                        new GUIContent("Adaptive Sampling", "Only record keyframes when bone velocity changes. Reduces keyframe density by 70-90%."),
+                        _enableAdaptiveSampling);
+
+                    if (_enableAdaptiveSampling)
+                    {
+                        EditorGUI.indentLevel++;
+                        _adaptiveTolerance = EditorGUILayout.Slider(
+                            new GUIContent("Tolerance", "Max error before a new keyframe is recorded. Lower = more keyframes."),
+                            _adaptiveTolerance, 0.0001f, 0.1f);
+                        _adaptiveMaxInterval = EditorGUILayout.Slider(
+                            new GUIContent("Max Interval (s)", "Maximum time between forced keyframes to prevent long gaps."),
+                            _adaptiveMaxInterval, 0.1f, 5f);
+                        EditorGUI.indentLevel--;
+                    }
                 }
 
                 // Clip Name
@@ -547,7 +571,8 @@ namespace MocapTools
 
             // Start recording
             _isArmed = true;
-            _humanoidRecorder.BeginRecordingHumanoid(_resolvedAnimator, _fps, _countdownSeconds, _recordRootMotion);
+            _humanoidRecorder.BeginRecordingHumanoid(_resolvedAnimator, _fps, _countdownSeconds, _recordRootMotion,
+                _enableAdaptiveSampling, _adaptiveTolerance, _adaptiveMaxInterval);
         }
 
         private void StopRecording()
@@ -894,6 +919,9 @@ namespace MocapTools
             _autoExportFbx = EditorPrefs.GetBool(PREFS_AUTO_FBX, false);
             _recordMode = (RecordMode)EditorPrefs.GetInt(PREFS_RECORD_MODE, 0);
             _recordRootMotion = EditorPrefs.GetBool(PREFS_ROOT_MOTION, false);
+            _enableAdaptiveSampling = EditorPrefs.GetBool(PREFS_ADAPTIVE_SAMPLING, true);
+            _adaptiveTolerance = EditorPrefs.GetFloat(PREFS_ADAPTIVE_TOLERANCE, 0.005f);
+            _adaptiveMaxInterval = EditorPrefs.GetFloat(PREFS_ADAPTIVE_INTERVAL, 0.5f);
 
             // Try to restore character root reference
             string rootPath = EditorPrefs.GetString(PREFS_SKELETON_ROOT, "");
@@ -920,6 +948,9 @@ namespace MocapTools
             EditorPrefs.SetBool(PREFS_AUTO_FBX, _autoExportFbx);
             EditorPrefs.SetInt(PREFS_RECORD_MODE, (int)_recordMode);
             EditorPrefs.SetBool(PREFS_ROOT_MOTION, _recordRootMotion);
+            EditorPrefs.SetBool(PREFS_ADAPTIVE_SAMPLING, _enableAdaptiveSampling);
+            EditorPrefs.SetFloat(PREFS_ADAPTIVE_TOLERANCE, _adaptiveTolerance);
+            EditorPrefs.SetFloat(PREFS_ADAPTIVE_INTERVAL, _adaptiveMaxInterval);
 
             if (_characterRoot != null)
             {
