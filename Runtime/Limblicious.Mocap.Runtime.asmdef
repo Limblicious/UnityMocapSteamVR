@@ -1,7 +1,10 @@
 {
     "name": "Limblicious.Mocap.Runtime",
     "rootNamespace": "MocapTools",
-    "references": [],
+    "references": [
+        "Unity.XR.Hands",
+        "Unity.InputSystem"
+    ],
     "includePlatforms": [],
     "excludePlatforms": [],
     "allowUnsafeCode": false,
