@@ -6,8 +6,5 @@
   "unity": "2022.3",
   "author": {
     "name": "Limblicious"
-  },
-  "dependencies": {
-    "com.unity.xr.hands": "1.6.3"
   }
 }

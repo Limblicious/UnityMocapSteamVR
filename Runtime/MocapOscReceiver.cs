@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
@@ -20,8 +19,6 @@ namespace MocapTools
         public const int JointCount = 26;
 
         public int handedness;
-        public string serial;
-        public string gloveType;
         public Vector3[] positions;
         public Quaternion[] rotations;
         public float receivedTime;
@@ -56,47 +53,53 @@ namespace MocapTools
         public const int DefaultPort = 19002;
         public const int LeftHand = 1;
         public const int RightHand = 2;
+        const int ReceiveBufferSize = 65535;
+
+        static readonly byte[] KinematicAddressBytes = Encoding.ASCII.GetBytes(KinematicAddress);
+        static readonly byte[] OrientationAddressBytes = Encoding.ASCII.GetBytes(OrientationAddress);
+        static readonly byte[] KinematicTagBytes = Encoding.ASCII.GetBytes(
+            ",iiiss" + new string('f', GloveKinematicFrame.JointCount * 7));
+        static readonly byte[] OrientationTagBytes = Encoding.ASCII.GetBytes(",iiissfffffff");
 
         [Tooltip("UDP port the Reality Core Driver streams OSC to.")]
         public int port = DefaultPort;
 
         [Tooltip("Log a periodic packet-rate status line while receiving.")]
-        public bool logStatus = true;
+        public bool logStatus = false;
 
-        [Tooltip("Log the detailed per-5s parse diagnostics line (debug only).")]
-        public bool logDiagnostics = false;
+        sealed class FrameBuffer
+        {
+            public readonly Vector3[] positions = new Vector3[GloveKinematicFrame.JointCount];
+            public readonly Quaternion[] rotations = new Quaternion[GloveKinematicFrame.JointCount];
+            public float receivedTime;
+        }
 
         readonly object _lock = new object();
-        readonly Dictionary<int, GloveKinematicFrame> _latestFrames = new Dictionary<int, GloveKinematicFrame>();
-        readonly Dictionary<int, Quaternion> _orientations = new Dictionary<int, Quaternion>();
-        readonly Dictionary<int, Vector3> _accelerations = new Dictionary<int, Vector3>();
-        readonly Dictionary<int, string> _serials = new Dictionary<int, string>();
-        readonly List<int> _pendingKinematicHands = new List<int>();
-        readonly List<int> _pendingOrientationHands = new List<int>();
-
+        readonly FrameBuffer[] _writeFrames = CreateFrameBuffers();
+        readonly FrameBuffer[] _pendingFrames = CreateFrameBuffers();
+        readonly FrameBuffer[] _mainThreadFrames = CreateFrameBuffers();
+        readonly GloveKinematicFrame[] _latestFrames = new GloveKinematicFrame[3];
+        readonly Quaternion[] _orientations = new Quaternion[3];
+        readonly Vector3[] _accelerations = new Vector3[3];
         readonly byte[] _floatBytes = new byte[4];
+        readonly byte[] _receiveBuffer = new byte[ReceiveBufferSize];
         readonly Stopwatch _clock = new Stopwatch();
-        UdpClient _client;
+        Socket _socket;
         Thread _receiveThread;
         volatile bool _running;
         bool _bindFailed;
-        int _packetsSinceLog;
-        float _lastLogTime = float.NegativeInfinity;
+        long _packetsSinceLog;
+        float _lastStatusLogTime = float.NegativeInfinity;
         float _lastPacketTime = float.NegativeInfinity;
-        bool _loggedFirstPacket;
         bool _loggedBind;
         bool _loggedFirstDatagram;
-        long _datagramsReceived;
-        long _countKinematic;
-        long _countOrientation;
-        long _countOtherAddress;
-        long _countBadHeader;
-        long _countBadTag;
-        long _countKinBranch;
-        long _countFailFloat;
-        string _firstBigAddress;
-        string _firstBigTag;
-        int _firstBigLen;
+        bool _loggedFirstKinematic;
+        int _firstDatagramLength;
+        int _firstKinematicHand;
+        int _pendingKinematicMask;
+        int _pendingOrientationMask;
+        int _validOrientationMask;
+        long _parseErrors;
 
         public event Action<int, GloveKinematicFrame> KinematicFrameReceived;
         public event Action<int, Quaternion> OrientationReceived;
@@ -123,123 +126,152 @@ namespace MocapTools
 
         void Update()
         {
-            if (logDiagnostics && Time.realtimeSinceStartup - _lastLogTime >= 5f)
+            int firstDatagramLength = Volatile.Read(ref _firstDatagramLength);
+            if (!_loggedFirstDatagram && firstDatagramLength > 0)
             {
-                _lastLogTime = Time.realtimeSinceStartup;
-                bool threadAlive = _receiveThread != null && _receiveThread.IsAlive;
-                string hands = string.Empty;
-                lock (_lock)
-                {
-                    foreach (var kvp in _latestFrames)
-                    {
-                        hands += (hands.Length > 0 ? ", " : string.Empty) +
-                                 $"hand={kvp.Key} joints={kvp.Value.positions?.Length ?? 0}";
-                    }
-                }
-                Debug.Log($"[MocapOSC] diag: datagrams={Interlocked.Read(ref _datagramsReceived)} running={_running} threadAlive={threadAlive} bound={_client != null} frames=[{hands}] kin={Interlocked.Read(ref _countKinematic)} kinBranch={Interlocked.Read(ref _countKinBranch)} orient={Interlocked.Read(ref _countOrientation)} other={Interlocked.Read(ref _countOtherAddress)} badtag={Interlocked.Read(ref _countBadTag)} badhdr={Interlocked.Read(ref _countBadHeader)} failFloat={Interlocked.Read(ref _countFailFloat)} firstBig={_firstBigLen}:{_firstBigAddress}:{_firstBigTag?.Length}");
+                _loggedFirstDatagram = true;
+                Debug.Log("[MocapOSC] First datagram received: " + firstDatagramLength + " bytes.");
             }
 
-            if (logStatus && IsReceiving && Time.realtimeSinceStartup - _lastLogTime >= 5f)
+            int firstKinematicHand = Volatile.Read(ref _firstKinematicHand);
+            if (!_loggedFirstKinematic && firstKinematicHand != 0)
             {
-                float elapsed = Time.realtimeSinceStartup - _lastLogTime;
-                if (elapsed > 0.001f)
-                {
-                    PacketsPerSecond = _packetsSinceLog / elapsed;
-                }
-                _packetsSinceLog = 0;
-                _lastLogTime = Time.realtimeSinceStartup;
-                string hands = string.Empty;
-                lock (_lock)
-                {
-                    foreach (var kvp in _latestFrames)
-                    {
-                        hands += (hands.Length > 0 ? ", " : string.Empty) + kvp.Key;
-                    }
-                }
-                Debug.Log($"[MocapOSC] Receiving {PacketsPerSecond:F0} pkt/s, hands=[{hands}]");
+                _loggedFirstKinematic = true;
+                Debug.Log($"[MocapOSC] First kinematic packet: hand={firstKinematicHand} " +
+                          $"({GloveKinematicFrame.JointCount} joints).");
             }
 
-            List<int> pendingKinematic = null;
-            List<int> pendingOrientation = null;
+            GloveKinematicFrame leftFrame = default;
+            GloveKinematicFrame rightFrame = default;
+            Quaternion leftOrientation = default;
+            Quaternion rightOrientation = default;
+            bool dispatchLeftFrame = false;
+            bool dispatchRightFrame = false;
+            bool dispatchLeftOrientation = false;
+            bool dispatchRightOrientation = false;
+
             lock (_lock)
             {
-                if (_pendingKinematicHands.Count > 0)
+                if ((_pendingKinematicMask & (1 << LeftHand)) != 0)
                 {
-                    pendingKinematic = new List<int>(_pendingKinematicHands);
-                    _pendingKinematicHands.Clear();
+                    leftFrame = PromotePendingFrame(LeftHand);
+                    dispatchLeftFrame = true;
                 }
-                if (_pendingOrientationHands.Count > 0)
+                if ((_pendingKinematicMask & (1 << RightHand)) != 0)
                 {
-                    pendingOrientation = new List<int>(_pendingOrientationHands);
-                    _pendingOrientationHands.Clear();
+                    rightFrame = PromotePendingFrame(RightHand);
+                    dispatchRightFrame = true;
                 }
+                _pendingKinematicMask = 0;
+
+                if ((_pendingOrientationMask & (1 << LeftHand)) != 0)
+                {
+                    leftOrientation = _orientations[LeftHand];
+                    dispatchLeftOrientation = true;
+                }
+                if ((_pendingOrientationMask & (1 << RightHand)) != 0)
+                {
+                    rightOrientation = _orientations[RightHand];
+                    dispatchRightOrientation = true;
+                }
+                _pendingOrientationMask = 0;
             }
 
-            if (pendingKinematic != null && KinematicFrameReceived != null)
+            Action<int, GloveKinematicFrame> frameCallback = KinematicFrameReceived;
+            if (frameCallback != null)
             {
-                for (int i = 0; i < pendingKinematic.Count; i++)
-                {
-                    int hand = pendingKinematic[i];
-                    GloveKinematicFrame frame;
-                    lock (_lock)
-                    {
-                        if (!_latestFrames.TryGetValue(hand, out frame))
-                        {
-                            continue;
-                        }
-                    }
-                    KinematicFrameReceived.Invoke(hand, frame);
-                }
+                if (dispatchLeftFrame) frameCallback.Invoke(LeftHand, leftFrame);
+                if (dispatchRightFrame) frameCallback.Invoke(RightHand, rightFrame);
             }
 
-            if (pendingOrientation != null && OrientationReceived != null)
+            Action<int, Quaternion> orientationCallback = OrientationReceived;
+            if (orientationCallback != null)
             {
-                for (int i = 0; i < pendingOrientation.Count; i++)
-                {
-                    int hand = pendingOrientation[i];
-                    Quaternion orientation;
-                    lock (_lock)
-                    {
-                        if (!_orientations.TryGetValue(hand, out orientation))
-                        {
-                            continue;
-                        }
-                    }
-                    OrientationReceived.Invoke(hand, orientation);
-                }
+                if (dispatchLeftOrientation) orientationCallback.Invoke(LeftHand, leftOrientation);
+                if (dispatchRightOrientation) orientationCallback.Invoke(RightHand, rightOrientation);
             }
+
+            float now = Time.realtimeSinceStartup;
+            if (logStatus && IsReceiving && now - _lastStatusLogTime >= 5f)
+            {
+                float elapsed = now - _lastStatusLogTime;
+                if (elapsed > 0.001f)
+                {
+                    PacketsPerSecond = Interlocked.Exchange(ref _packetsSinceLog, 0L) / elapsed;
+                }
+                _lastStatusLogTime = now;
+                bool hasLeft;
+                bool hasRight;
+                lock (_lock)
+                {
+                    hasLeft = _latestFrames[LeftHand].IsValid;
+                    hasRight = _latestFrames[RightHand].IsValid;
+                }
+                Debug.Log($"[MocapOSC] Receiving {PacketsPerSecond:F0} pkt/s, " +
+                          $"left={hasLeft}, right={hasRight}, parseErrors={Interlocked.Read(ref _parseErrors)}");
+            }
+        }
+
+        GloveKinematicFrame PromotePendingFrame(int handedness)
+        {
+            FrameBuffer previousMainThreadFrame = _mainThreadFrames[handedness];
+            _mainThreadFrames[handedness] = _pendingFrames[handedness];
+            _pendingFrames[handedness] = previousMainThreadFrame;
+
+            FrameBuffer promoted = _mainThreadFrames[handedness];
+            GloveKinematicFrame frame = new GloveKinematicFrame
+            {
+                handedness = handedness,
+                positions = promoted.positions,
+                rotations = promoted.rotations,
+                receivedTime = promoted.receivedTime
+            };
+            _latestFrames[handedness] = frame;
+            return frame;
         }
 
         public bool TryGetLatestFrame(int handedness, out GloveKinematicFrame frame)
         {
+            if (!IsValidHandedness(handedness))
+            {
+                frame = default;
+                return false;
+            }
+
             lock (_lock)
             {
-                return _latestFrames.TryGetValue(handedness, out frame);
+                frame = _latestFrames[handedness];
+                return frame.IsValid;
             }
         }
 
         public bool TryGetOrientation(int handedness, out Quaternion orientation)
         {
+            if (!IsValidHandedness(handedness))
+            {
+                orientation = default;
+                return false;
+            }
+
             lock (_lock)
             {
-                return _orientations.TryGetValue(handedness, out orientation);
+                orientation = _orientations[handedness];
+                return (_validOrientationMask & (1 << handedness)) != 0;
             }
         }
 
         public bool TryGetAcceleration(int handedness, out Vector3 acceleration)
         {
-            lock (_lock)
+            if (!IsValidHandedness(handedness))
             {
-                return _accelerations.TryGetValue(handedness, out acceleration);
+                acceleration = default;
+                return false;
             }
-        }
 
-        public string GetSerial(int handedness)
-        {
             lock (_lock)
             {
-                _serials.TryGetValue(handedness, out string serial);
-                return serial;
+                acceleration = _accelerations[handedness];
+                return (_validOrientationMask & (1 << handedness)) != 0;
             }
         }
 
@@ -253,12 +285,15 @@ namespace MocapTools
             _bindFailed = false;
             try
             {
-                _client = new UdpClient(new IPEndPoint(IPAddress.Loopback, port));
-                _client.Client.ReceiveTimeout = 250;
+                _socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+                _socket.ReceiveBufferSize = 1024 * 1024;
+                _socket.Bind(new IPEndPoint(IPAddress.Loopback, port));
             }
             catch (SocketException ex)
             {
                 _bindFailed = true;
+                _socket?.Dispose();
+                _socket = null;
                 if (!_loggedBind)
                 {
                     _loggedBind = true;
@@ -268,6 +303,11 @@ namespace MocapTools
                 return;
             }
 
+            _firstDatagramLength = 0;
+            _firstKinematicHand = 0;
+            _loggedFirstDatagram = false;
+            _loggedFirstKinematic = false;
+            _lastStatusLogTime = Time.realtimeSinceStartup;
             _running = true;
             _clock.Restart();
             Debug.Log("[MocapOSC] Listening on UDP port " + port);
@@ -284,220 +324,196 @@ namespace MocapTools
             _running = false;
             try
             {
-                _client?.Dispose();
+                _socket?.Dispose();
             }
             catch (Exception)
             {
             }
-            _client = null;
 
             if (_receiveThread != null)
             {
                 if (!_receiveThread.Join(500))
                 {
-                    try
-                    {
-                        _receiveThread.Abort();
-                    }
-                    catch (Exception)
-                    {
-                    }
+                    Debug.LogWarning("[MocapOSC] Receive thread did not stop within 500 ms.");
                 }
                 _receiveThread = null;
             }
+            _socket = null;
 
             lock (_lock)
             {
-                _latestFrames.Clear();
-                _orientations.Clear();
-                _accelerations.Clear();
-                _pendingKinematicHands.Clear();
-                _pendingOrientationHands.Clear();
+                Array.Clear(_latestFrames, 0, _latestFrames.Length);
+                Array.Clear(_orientations, 0, _orientations.Length);
+                Array.Clear(_accelerations, 0, _accelerations.Length);
+                _pendingKinematicMask = 0;
+                _pendingOrientationMask = 0;
+                _validOrientationMask = 0;
                 _lastPacketTime = float.NegativeInfinity;
             }
         }
 
         void ReceiveLoop()
         {
-            IPEndPoint remote = new IPEndPoint(IPAddress.Any, 0);
-            Vector3[] positions = new Vector3[GloveKinematicFrame.JointCount];
-            Quaternion[] rotations = new Quaternion[GloveKinematicFrame.JointCount];
-            Vector3[] positionsSwap = new Vector3[GloveKinematicFrame.JointCount];
-            Quaternion[] rotationsSwap = new Quaternion[GloveKinematicFrame.JointCount];
+            Socket socket = _socket;
 
             while (_running)
             {
-                byte[] data;
+                int length;
                 try
                 {
-                    data = _client.Receive(ref remote);
+                    length = socket.Receive(_receiveBuffer);
                 }
                 catch (SocketException)
                 {
-                    continue;
+                    if (_running) Interlocked.Increment(ref _parseErrors);
+                    break;
                 }
                 catch (ObjectDisposedException)
                 {
                     break;
                 }
 
-                if (!_loggedFirstDatagram)
-                {
-                    _loggedFirstDatagram = true;
-                    Debug.Log("[MocapOSC] First datagram received: " + data.Length + " bytes.");
-                }
-                Interlocked.Increment(ref _datagramsReceived);
-
-                if (data.Length > 900 && _firstBigAddress == null)
-                {
-                    int aEnd = Array.IndexOf(data, (byte)0, 0);
-                    int tStart = (aEnd + 1 + 3) & ~3;
-                    int tEnd = Array.IndexOf(data, (byte)0, tStart);
-                    _firstBigLen = data.Length;
-                    _firstBigAddress = aEnd > 0 ? Encoding.UTF8.GetString(data, 0, aEnd) : "?";
-                    _firstBigTag = tEnd > tStart ? Encoding.UTF8.GetString(data, tStart, tEnd - tStart) : "?";
-                }
+                Interlocked.CompareExchange(ref _firstDatagramLength, length, 0);
 
                 try
                 {
-                    ProcessPacket(data, positions, rotations, positionsSwap, rotationsSwap);
+                    ProcessPacket(_receiveBuffer, length);
                 }
-                catch (Exception ex)
+                catch (Exception)
                 {
-                    Debug.LogWarning("[MocapOSC] Receive-loop exception: " + ex);
+                    Interlocked.Increment(ref _parseErrors);
                 }
             }
         }
 
-        void ProcessPacket(byte[] data, Vector3[] positions, Quaternion[] rotations,
-            Vector3[] positionsSwap, Quaternion[] rotationsSwap)
+        void ProcessPacket(byte[] data, int length)
         {
             int offset = 0;
-            if (!TryReadOscString(data, ref offset, out string address))
+            if (!TryReadOscStringBounds(data, length, ref offset, out int addressStart, out int addressLength) ||
+                !TryReadOscStringBounds(data, length, ref offset, out int tagStart, out int tagLength))
             {
                 return;
             }
 
-            if (!TryReadOscString(data, ref offset, out string tag))
+            bool isKinematic = OscStringEquals(data, addressStart, addressLength, KinematicAddressBytes);
+            bool isOrientation = OscStringEquals(data, addressStart, addressLength, OrientationAddressBytes);
+            if (!isKinematic && !isOrientation)
             {
                 return;
             }
 
-            if (!TryReadInt32(data, ref offset, out _) ||
-                !TryReadInt32(data, ref offset, out _) ||
-                !TryReadInt32(data, ref offset, out int handedness) ||
-                !TryReadOscString(data, ref offset, out string serial) ||
-                !TryReadOscString(data, ref offset, out _))
+            byte[] expectedTag = isKinematic ? KinematicTagBytes : OrientationTagBytes;
+            if (!OscStringEquals(data, tagStart, tagLength, expectedTag))
             {
-                Interlocked.Increment(ref _countBadHeader);
                 return;
             }
 
-            if (address == KinematicAddress)
+            if (!TryReadInt32(data, length, ref offset, out _) ||
+                !TryReadInt32(data, length, ref offset, out _) ||
+                !TryReadInt32(data, length, ref offset, out int handedness) ||
+                !TryReadOscStringBounds(data, length, ref offset, out _, out _) ||
+                !TryReadOscStringBounds(data, length, ref offset, out _, out _) ||
+                !IsValidHandedness(handedness))
             {
-                Interlocked.Increment(ref _countKinBranch);
-                if (tag.Length != 6 + GloveKinematicFrame.JointCount * 7)
-                {
-                    Interlocked.Increment(ref _countBadTag);
-                    return;
-                }
+                return;
+            }
+
+            if (isKinematic)
+            {
+                FrameBuffer writeFrame = _writeFrames[handedness];
 
                 for (int i = 0; i < GloveKinematicFrame.JointCount; i++)
                 {
-                    if (!TryReadFloat(data, ref offset, out float x) ||
-                        !TryReadFloat(data, ref offset, out float y) ||
-                        !TryReadFloat(data, ref offset, out float z) ||
-                        !TryReadFloat(data, ref offset, out float qx) ||
-                        !TryReadFloat(data, ref offset, out float qy) ||
-                        !TryReadFloat(data, ref offset, out float qz) ||
-                        !TryReadFloat(data, ref offset, out float qw))
+                    if (!TryReadFloat(data, length, ref offset, out float x) ||
+                        !TryReadFloat(data, length, ref offset, out float y) ||
+                        !TryReadFloat(data, length, ref offset, out float z) ||
+                        !TryReadFloat(data, length, ref offset, out float qx) ||
+                        !TryReadFloat(data, length, ref offset, out float qy) ||
+                        !TryReadFloat(data, length, ref offset, out float qz) ||
+                        !TryReadFloat(data, length, ref offset, out float qw))
                     {
-                        Interlocked.Increment(ref _countFailFloat);
                         return;
                     }
-                    positionsSwap[i] = new Vector3(x, y, z);
-                    rotationsSwap[i] = new Quaternion(qx, qy, qz, qw);
+                    writeFrame.positions[i] = new Vector3(x, y, z);
+                    writeFrame.rotations[i] = new Quaternion(qx, qy, qz, qw);
                 }
 
-                (positionsSwap, positions) = (positions, positionsSwap);
-                (rotationsSwap, rotations) = (rotations, rotationsSwap);
+                float receivedTime = (float)_clock.Elapsed.TotalSeconds;
+                writeFrame.receivedTime = receivedTime;
 
                 lock (_lock)
                 {
-                    _lastPacketTime = (float)_clock.Elapsed.TotalSeconds;
-                    _packetsSinceLog++;
-                    _serials[handedness] = serial;
-                    _latestFrames[handedness] = new GloveKinematicFrame
-                    {
-                        handedness = handedness,
-                        serial = serial,
-                        positions = positions,
-                        rotations = rotations,
-                        receivedTime = (float)_clock.Elapsed.TotalSeconds
-                    };
-                    _pendingKinematicHands.Add(handedness);
-                    Interlocked.Increment(ref _countKinematic);
-                    if (!_loggedFirstPacket)
-                    {
-                        _loggedFirstPacket = true;
-                        Debug.Log($"[MocapOSC] First kinematic packet: hand={handedness} serial='{serial}' ({GloveKinematicFrame.JointCount} joints).");
-                    }
+                    FrameBuffer previousPending = _pendingFrames[handedness];
+                    _pendingFrames[handedness] = writeFrame;
+                    _writeFrames[handedness] = previousPending;
+                    _pendingKinematicMask |= 1 << handedness;
+                    _lastPacketTime = receivedTime;
                 }
+                Interlocked.Increment(ref _packetsSinceLog);
+                Interlocked.CompareExchange(ref _firstKinematicHand, handedness, 0);
             }
-            else if (address == OrientationAddress && tag == ",iiissfffffff")
+            else
             {
-                Interlocked.Increment(ref _countOrientation);
-                if (!TryReadFloat(data, ref offset, out float ax) ||
-                    !TryReadFloat(data, ref offset, out float ay) ||
-                    !TryReadFloat(data, ref offset, out float az) ||
-                    !TryReadFloat(data, ref offset, out float qx) ||
-                    !TryReadFloat(data, ref offset, out float qy) ||
-                    !TryReadFloat(data, ref offset, out float qz) ||
-                    !TryReadFloat(data, ref offset, out float qw))
+                if (!TryReadFloat(data, length, ref offset, out float ax) ||
+                    !TryReadFloat(data, length, ref offset, out float ay) ||
+                    !TryReadFloat(data, length, ref offset, out float az) ||
+                    !TryReadFloat(data, length, ref offset, out float qx) ||
+                    !TryReadFloat(data, length, ref offset, out float qy) ||
+                    !TryReadFloat(data, length, ref offset, out float qz) ||
+                    !TryReadFloat(data, length, ref offset, out float qw))
                 {
                     return;
                 }
 
+                float receivedTime = (float)_clock.Elapsed.TotalSeconds;
                 lock (_lock)
                 {
-                    _lastPacketTime = (float)_clock.Elapsed.TotalSeconds;
-                    _packetsSinceLog++;
-                    _serials[handedness] = serial;
                     _accelerations[handedness] = new Vector3(ax, ay, az);
                     _orientations[handedness] = new Quaternion(qx, qy, qz, qw);
-                    _pendingOrientationHands.Add(handedness);
+                    _pendingOrientationMask |= 1 << handedness;
+                    _validOrientationMask |= 1 << handedness;
+                    _lastPacketTime = receivedTime;
                 }
-            }
-            else
-            {
-                Interlocked.Increment(ref _countOtherAddress);
+                Interlocked.Increment(ref _packetsSinceLog);
             }
         }
 
-        static bool TryReadOscString(byte[] data, ref int offset, out string value)
+        static bool TryReadOscStringBounds(byte[] data, int length, ref int offset, out int start, out int count)
         {
-            value = null;
-            if (offset >= data.Length)
+            start = offset;
+            count = 0;
+            if ((uint)offset >= (uint)length)
             {
                 return false;
             }
 
-            int start = offset;
-            int end = Array.IndexOf(data, (byte)0, offset);
-            if (end < 0)
+            int end = offset;
+            while (end < length && data[end] != 0)
             {
-                return false;
+                end++;
             }
 
-            value = Encoding.UTF8.GetString(data, start, end - start);
+            if (end >= length) return false;
+
+            count = end - start;
             offset = (end + 1 + 3) & ~3;
-            return offset <= data.Length;
+            return offset <= length;
         }
 
-        static bool TryReadInt32(byte[] data, ref int offset, out int value)
+        static bool OscStringEquals(byte[] data, int start, int count, byte[] expected)
+        {
+            if (count != expected.Length) return false;
+            for (int i = 0; i < count; i++)
+            {
+                if (data[start + i] != expected[i]) return false;
+            }
+            return true;
+        }
+
+        static bool TryReadInt32(byte[] data, int length, ref int offset, out int value)
         {
             value = 0;
-            if (offset + 4 > data.Length)
+            if (offset + 4 > length)
             {
                 return false;
             }
@@ -507,10 +523,10 @@ namespace MocapTools
             return true;
         }
 
-        bool TryReadFloat(byte[] data, ref int offset, out float value)
+        bool TryReadFloat(byte[] data, int length, ref int offset, out float value)
         {
             value = 0f;
-            if (offset + 4 > data.Length)
+            if (offset + 4 > length)
             {
                 return false;
             }
@@ -522,6 +538,19 @@ namespace MocapTools
             value = BitConverter.ToSingle(_floatBytes, 0);
             offset += 4;
             return true;
+        }
+
+        static bool IsValidHandedness(int handedness)
+        {
+            return handedness == LeftHand || handedness == RightHand;
+        }
+
+        static FrameBuffer[] CreateFrameBuffers()
+        {
+            FrameBuffer[] buffers = new FrameBuffer[3];
+            buffers[LeftHand] = new FrameBuffer();
+            buffers[RightHand] = new FrameBuffer();
+            return buffers;
         }
     }
 }

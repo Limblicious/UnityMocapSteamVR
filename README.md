@@ -49,7 +49,9 @@ Records motion from a character in Play Mode into a `.anim` AnimationClip. Suppo
 - **Clip Name** &mdash; leave empty for auto-generated timestamped names (`Take_YYYYMMDD_HHmmss`).
 - **Output Folder** &mdash; default `Assets/Captures/Raw`.
 - **Record Root Motion** (Humanoid only) &mdash; records `RootT`/`RootQ` curves for root motion. Usually off for in-place animations.
-- **Adaptive Sampling** &mdash; only records keyframes when bone velocity changes, reducing keyframe density by 70-90%. Configurable tolerance and max interval between forced keyframes.
+- **Bake Key Reduction** (Transform only, default on) &mdash; uses Unity's grouped, rotation-aware native reducer at the selected recording FPS. Position error is a percentage; rotation error is degrees.
+- **Capture Delta Gate** (Transform only, optional) &mdash; skips whole-hierarchy snapshots until any bound transform crosses a local-position or angular threshold, with a forced-key interval. Bake reduction remains the primary thinning pass.
+- **Adaptive Sampling** (Humanoid only) &mdash; only records keyframes when muscle velocity changes, reducing keyframe density. Configurable tolerance and max interval between forced keyframes.
 - **Auto Export FBX** (Transform only) &mdash; optional FBX export via reflection on the `com.unity.formats.fbx` package. No hard dependency; gracefully skips if the package is not installed.
 
 ### Bone Root Auto-Detection (Transform Mode)
@@ -68,6 +70,16 @@ When you assign a Character Root, the tool automatically resolves the bone hiera
 | `Editor/MocapTakeRecorderWindow.cs` | Editor Window | Main UI. Manages settings, arm/stop controls, clip saving, FBX export. |
 | `Editor/MocapSkeletonRecorder.cs` | Editor Component | Transform mode worker. Uses `GameObjectRecorder` to capture bone transforms in `LateUpdate` at `DefaultExecutionOrder(10000)` (post-IK). |
 | `Editor/MocapHumanoidRecorder.cs` | Editor Component | Humanoid mode worker. Uses `HumanPoseHandler` to capture all muscle curves in `LateUpdate` at `DefaultExecutionOrder(10000)`. |
+
+---
+
+## StretchSense OSC Finger Tracking
+
+`MocapOscReceiver` decodes the StretchSense Reality Core Driver's direct OSC hand stream without loading a vendor OpenXR hand-tracking layer. It receives 26 OpenXR-ordered joints per hand on UDP port 19002 and keeps the latest frame in preallocated buffers. A standalone relay is expected to forward XR Game's port 9002 to 19002.
+
+`MocapFingerPoseBridge` maps 15 finger joints per hand onto Linnra-style finger bone names. It captures rest after a stable-frame window, applies rest-relative rotations, clamps sudden per-frame changes, smooths the result, and automatically waits for a new stable rest pose after a stream gap. Hand position and orientation remain the responsibility of the tracker/IK pipeline.
+
+Both components are runtime-safe and allocate no managed memory per received packet after startup. VMC and XR Hands diagnostic receivers are intentionally not part of this path.
 
 ---
 
@@ -186,6 +198,8 @@ com.limblicious.mocap/
 │   ├── Limblicious.Mocap.Runtime.asmdef
 │   ├── MocapCalibratorRunner.cs          # Calibration engine
 │   ├── MocapProportionScaler.cs          # Runtime proportion scaling
+│   ├── MocapOscReceiver.cs                # Direct StretchSense OSC receiver
+│   ├── MocapFingerPoseBridge.cs           # Stable-rest finger retargeting
 │   └── AnimationClipSimplifier.cs        # Curve simplification utility
 └── Editor/
     ├── Limblicious.Mocap.Editor.asmdef
@@ -208,6 +222,8 @@ All scripts are in the `MocapTools` namespace. `MocapSkeletonRecorder` and `Moca
 | FinalIK (VRIK) | No | Detected by type name string at runtime (`"VRIK"`, `"FullBodyBipedIK"`) |
 | SteamVR | No | Tracker naming convention only (`Tracked_Head`, etc.) |
 | FBX Exporter (`com.unity.formats.fbx`) | No | Optional; accessed via reflection |
+
+The direct OSC finger path has no package dependency on SteamVR, XR Hands, or the Input System.
 
 ## Output Folders
 

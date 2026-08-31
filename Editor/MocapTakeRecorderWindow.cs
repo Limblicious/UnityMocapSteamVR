@@ -39,6 +39,13 @@ namespace MocapTools
         private bool _enableAdaptiveSampling = true;
         private float _adaptiveTolerance = 0.005f;
         private float _adaptiveMaxInterval = 0.5f;
+        private bool _enableBakeReduction = true;
+        private float _bakePositionErrorPercent = 0.5f;
+        private float _bakeRotationErrorDegrees = 0.5f;
+        private bool _enableCaptureDeltaGate = false;
+        private float _capturePositionDelta = 0.0005f;
+        private float _captureRotationDeltaDegrees = 0.25f;
+        private float _captureForcedKeyInterval = 0.5f;
         private Animator _resolvedAnimator;  // Auto-detected animator for humanoid mode
 
         // Runtime state
@@ -70,6 +77,13 @@ namespace MocapTools
         private const string PREFS_ADAPTIVE_SAMPLING = "MocapRecorder_AdaptiveSampling";
         private const string PREFS_ADAPTIVE_TOLERANCE = "MocapRecorder_AdaptiveTolerance";
         private const string PREFS_ADAPTIVE_INTERVAL = "MocapRecorder_AdaptiveMaxInterval";
+        private const string PREFS_BAKE_REDUCTION = "MocapRecorder_BakeReduction";
+        private const string PREFS_BAKE_POSITION_ERROR = "MocapRecorder_BakePositionErrorPercent";
+        private const string PREFS_BAKE_ROTATION_ERROR = "MocapRecorder_BakeRotationErrorDegrees";
+        private const string PREFS_CAPTURE_DELTA_GATE = "MocapRecorder_CaptureDeltaGate";
+        private const string PREFS_CAPTURE_POSITION_DELTA = "MocapRecorder_CapturePositionDelta";
+        private const string PREFS_CAPTURE_ROTATION_DELTA = "MocapRecorder_CaptureRotationDeltaDegrees";
+        private const string PREFS_CAPTURE_FORCED_INTERVAL = "MocapRecorder_CaptureForcedKeyInterval";
 
         [MenuItem("Tools/Mocap/Take Recorder")]
         public static void ShowWindow()
@@ -250,6 +264,7 @@ namespace MocapTools
                 if (_recordMode == RecordMode.Transform)
                 {
                     DrawBoneRootStatus();
+                    DrawTransformSamplingSettings();
                 }
                 else
                 {
@@ -322,6 +337,48 @@ namespace MocapTools
                 {
                     EditorGUILayout.HelpBox($"Auto name: {GenerateClipName()}", MessageType.None);
                 }
+            }
+        }
+
+        private void DrawTransformSamplingSettings()
+        {
+            EditorGUILayout.Space(3);
+
+            _enableBakeReduction = EditorGUILayout.Toggle(
+                new GUIContent("Bake Key Reduction", "Use Unity's rotation-aware key reducer when creating the clip."),
+                _enableBakeReduction);
+            if (_enableBakeReduction)
+            {
+                EditorGUI.indentLevel++;
+                _bakePositionErrorPercent = EditorGUILayout.Slider(
+                    new GUIContent("Position Error (%)", "Maximum native position-reduction error, expressed as a percentage."),
+                    _bakePositionErrorPercent, 0.01f, 5f);
+                _bakeRotationErrorDegrees = EditorGUILayout.Slider(
+                    new GUIContent("Rotation Error (deg)", "Maximum native rotation-reduction error in degrees."),
+                    _bakeRotationErrorDegrees, 0.01f, 5f);
+                EditorGUI.indentLevel--;
+            }
+
+            _enableCaptureDeltaGate = EditorGUILayout.Toggle(
+                new GUIContent("Capture Delta Gate", "Optional: skip whole-hierarchy snapshots until any recorded transform exceeds a position or rotation threshold."),
+                _enableCaptureDeltaGate);
+            if (_enableCaptureDeltaGate)
+            {
+                EditorGUI.indentLevel++;
+                _capturePositionDelta = EditorGUILayout.Slider(
+                    new GUIContent("Position Delta", "Local-position change required to capture a snapshot, in Unity units."),
+                    _capturePositionDelta, 0.0001f, 0.02f);
+                _captureRotationDeltaDegrees = EditorGUILayout.Slider(
+                    new GUIContent("Rotation Delta (deg)", "Local-rotation change required to capture a snapshot."),
+                    _captureRotationDeltaDegrees, 0.05f, 5f);
+                _captureForcedKeyInterval = EditorGUILayout.Slider(
+                    new GUIContent("Forced Interval (s)", "Maximum time between recorder snapshots, even while the rig is still."),
+                    _captureForcedKeyInterval, 0.1f, 2f);
+                EditorGUI.indentLevel--;
+                EditorGUILayout.HelpBox(
+                    "The capture gate applies to the recorder's whole snapshot: motion on any bound bone captures all bound transforms. " +
+                    "Bake Key Reduction remains the primary key-thinning pass.",
+                    MessageType.Info);
             }
         }
 
@@ -530,7 +587,15 @@ namespace MocapTools
 
             // Start recording: characterRoot for path relativity, boneRoot for which transforms to record
             _isArmed = true;
-            _recorder.BeginRecording(_characterRoot, _resolvedBoneRoot, _fps, _countdownSeconds);
+            var options = MocapSkeletonRecorder.TransformRecordingOptions.Default;
+            options.enableBakeReduction = _enableBakeReduction;
+            options.bakePositionErrorPercent = _bakePositionErrorPercent;
+            options.bakeRotationErrorDegrees = _bakeRotationErrorDegrees;
+            options.enableCaptureDeltaGate = _enableCaptureDeltaGate;
+            options.capturePositionDelta = _capturePositionDelta;
+            options.captureRotationDeltaDegrees = _captureRotationDeltaDegrees;
+            options.forcedKeyIntervalSeconds = _captureForcedKeyInterval;
+            _recorder.BeginRecording(_characterRoot, _resolvedBoneRoot, _fps, _countdownSeconds, options);
         }
 
         private void ArmHumanoidRecording()
@@ -922,6 +987,13 @@ namespace MocapTools
             _enableAdaptiveSampling = EditorPrefs.GetBool(PREFS_ADAPTIVE_SAMPLING, true);
             _adaptiveTolerance = EditorPrefs.GetFloat(PREFS_ADAPTIVE_TOLERANCE, 0.005f);
             _adaptiveMaxInterval = EditorPrefs.GetFloat(PREFS_ADAPTIVE_INTERVAL, 0.5f);
+            _enableBakeReduction = EditorPrefs.GetBool(PREFS_BAKE_REDUCTION, true);
+            _bakePositionErrorPercent = EditorPrefs.GetFloat(PREFS_BAKE_POSITION_ERROR, 0.5f);
+            _bakeRotationErrorDegrees = EditorPrefs.GetFloat(PREFS_BAKE_ROTATION_ERROR, 0.5f);
+            _enableCaptureDeltaGate = EditorPrefs.GetBool(PREFS_CAPTURE_DELTA_GATE, false);
+            _capturePositionDelta = EditorPrefs.GetFloat(PREFS_CAPTURE_POSITION_DELTA, 0.0005f);
+            _captureRotationDeltaDegrees = EditorPrefs.GetFloat(PREFS_CAPTURE_ROTATION_DELTA, 0.25f);
+            _captureForcedKeyInterval = EditorPrefs.GetFloat(PREFS_CAPTURE_FORCED_INTERVAL, 0.5f);
 
             // Try to restore character root reference
             string rootPath = EditorPrefs.GetString(PREFS_SKELETON_ROOT, "");
@@ -951,6 +1023,13 @@ namespace MocapTools
             EditorPrefs.SetBool(PREFS_ADAPTIVE_SAMPLING, _enableAdaptiveSampling);
             EditorPrefs.SetFloat(PREFS_ADAPTIVE_TOLERANCE, _adaptiveTolerance);
             EditorPrefs.SetFloat(PREFS_ADAPTIVE_INTERVAL, _adaptiveMaxInterval);
+            EditorPrefs.SetBool(PREFS_BAKE_REDUCTION, _enableBakeReduction);
+            EditorPrefs.SetFloat(PREFS_BAKE_POSITION_ERROR, _bakePositionErrorPercent);
+            EditorPrefs.SetFloat(PREFS_BAKE_ROTATION_ERROR, _bakeRotationErrorDegrees);
+            EditorPrefs.SetBool(PREFS_CAPTURE_DELTA_GATE, _enableCaptureDeltaGate);
+            EditorPrefs.SetFloat(PREFS_CAPTURE_POSITION_DELTA, _capturePositionDelta);
+            EditorPrefs.SetFloat(PREFS_CAPTURE_ROTATION_DELTA, _captureRotationDeltaDegrees);
+            EditorPrefs.SetFloat(PREFS_CAPTURE_FORCED_INTERVAL, _captureForcedKeyInterval);
 
             if (_characterRoot != null)
             {

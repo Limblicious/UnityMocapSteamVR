@@ -15,6 +15,29 @@ namespace MocapTools
     [DefaultExecutionOrder(10000)] // Run very late to capture post-IK transforms
     public class MocapSkeletonRecorder : MonoBehaviour
     {
+        [System.Serializable]
+        public struct TransformRecordingOptions
+        {
+            public bool enableBakeReduction;
+            public float bakePositionErrorPercent;
+            public float bakeRotationErrorDegrees;
+            public bool enableCaptureDeltaGate;
+            public float capturePositionDelta;
+            public float captureRotationDeltaDegrees;
+            public float forcedKeyIntervalSeconds;
+
+            public static TransformRecordingOptions Default => new TransformRecordingOptions
+            {
+                enableBakeReduction = true,
+                bakePositionErrorPercent = 0.5f,
+                bakeRotationErrorDegrees = 0.5f,
+                enableCaptureDeltaGate = false,
+                capturePositionDelta = 0.0005f,
+                captureRotationDeltaDegrees = 0.25f,
+                forcedKeyIntervalSeconds = 0.5f
+            };
+        }
+
 #if UNITY_EDITOR
         // Recording state
         private GameObjectRecorder _recorder;
@@ -26,6 +49,11 @@ namespace MocapTools
         private float _countdownRemaining;
         private bool _isCountingDown;
         private float _recordingStartTime;
+        private TransformRecordingOptions _options;
+        private readonly List<Transform> _boundTransforms = new List<Transform>();
+        private Vector3[] _lastSnapshotPositions;
+        private Quaternion[] _lastSnapshotRotations;
+        private float _pendingSnapshotDelta;
 
         // Events for UI feedback
         public System.Action<float> OnCountdownTick;
@@ -61,6 +89,15 @@ namespace MocapTools
         /// <param name="startDelaySeconds">Countdown before recording starts.</param>
         public void BeginRecording(Transform characterRoot, Transform boneRoot, int fps, float startDelaySeconds)
         {
+            BeginRecording(characterRoot, boneRoot, fps, startDelaySeconds, TransformRecordingOptions.Default);
+        }
+
+        /// <summary>
+        /// Begins recording with explicit bake-reduction and optional capture-gating settings.
+        /// </summary>
+        public void BeginRecording(Transform characterRoot, Transform boneRoot, int fps, float startDelaySeconds,
+            TransformRecordingOptions options)
+        {
             if (_isRecording || _isCountingDown)
             {
                 Debug.LogWarning("[MocapRecorder] Already recording or counting down. Call EndRecording first.");
@@ -88,6 +125,7 @@ namespace MocapTools
             _characterRoot = characterRoot;
             _boneRoot = boneRoot;
             _targetFps = Mathf.Max(1, fps);
+            _options = SanitizeOptions(options);
 
             if (startDelaySeconds > 0f)
             {
@@ -114,16 +152,20 @@ namespace MocapTools
             _recorder = new GameObjectRecorder(_characterRoot.gameObject);
 
             // Bind ONLY transforms under BONE ROOT (not tracker objects or other children)
+            _boundTransforms.Clear();
             BindTransformsRecursive(_boneRoot);
 
             // Take initial snapshot at t=0 for clean first keyframe
             _recorder.TakeSnapshot(0f);
+            CacheSnapshotPose();
+            _pendingSnapshotDelta = 0f;
 
             _isRecording = true;
             _recordingStartTime = Time.time;
 
             Debug.Log($"[MocapRecorder] Recording started at {_targetFps} FPS. " +
-                      $"Character: {_characterRoot.name}, Bones: {_boneRoot.name}");
+                      $"Character: {_characterRoot.name}, Bones: {_boneRoot.name}, " +
+                      $"Capture gate: {_options.enableCaptureDeltaGate}");
             OnRecordingStarted?.Invoke();
         }
 
@@ -133,6 +175,7 @@ namespace MocapTools
 
             // Bind this transform
             _recorder.BindComponentsOfType<Transform>(root.gameObject, recursive: false);
+            _boundTransforms.Add(root);
 
             // Recursively bind children
             foreach (Transform child in root)
@@ -172,13 +215,27 @@ namespace MocapTools
                 return null;
             }
 
+            // Preserve the final pose and full duration even if the capture gate has
+            // not accepted a regular snapshot since the last recorded key.
+            TakePendingSnapshot();
+
             // Create the animation clip
             AnimationClip clip = new AnimationClip();
             clip.name = string.IsNullOrEmpty(clipName) ? "RecordedClip" : clipName;
             clip.frameRate = _targetFps;
 
-            // Save recorded data to clip
-            _recorder.SaveToClip(clip);
+            // Unity's native filter performs grouped, rotation-aware key reduction.
+            // Pass the selected FPS explicitly; the convenience overload defaults to 60.
+            CurveFilterOptions filterOptions = new CurveFilterOptions
+            {
+                keyframeReduction = _options.enableBakeReduction,
+                unrollRotation = true,
+                positionError = _options.bakePositionErrorPercent,
+                rotationError = _options.bakeRotationErrorDegrees,
+                scaleError = 0.5f,
+                floatError = 0.5f
+            };
+            _recorder.SaveToClip(clip, _targetFps, filterOptions);
 
             // Ensure quaternion continuity to avoid rotation glitches
             clip.EnsureQuaternionContinuity();
@@ -196,6 +253,10 @@ namespace MocapTools
             _isRecording = false;
             _characterRoot = null;
             _boneRoot = null;
+            _boundTransforms.Clear();
+            _lastSnapshotPositions = null;
+            _lastSnapshotRotations = null;
+            _pendingSnapshotDelta = 0f;
 
             OnRecordingStopped?.Invoke();
 
@@ -268,6 +329,8 @@ namespace MocapTools
                     AnimationUtility.SetObjectReferenceCurve(clip, binding, null);
                 }
             }
+
+            clip.EnsureQuaternionContinuity();
 
             Debug.Log($"[MocapRecorder] Clip trimmed: {originalLength:F2}s -> {clip.length:F2}s (removed {trimStartSeconds:F2}s start, {trimEndSeconds:F2}s end). " +
                       $"Processed {trimmedCurves} curves, removed {removedScaleCurves} scale curves.");
@@ -354,8 +417,78 @@ namespace MocapTools
             if (_isRecording && _recorder != null)
             {
                 float deltaTime = _targetFps > 0 ? (1f / _targetFps) : Time.deltaTime;
-                _recorder.TakeSnapshot(deltaTime);
+                _pendingSnapshotDelta += deltaTime;
+                if (!_options.enableCaptureDeltaGate || ShouldTakeSnapshot())
+                {
+                    TakePendingSnapshot();
+                }
             }
+        }
+
+        private bool ShouldTakeSnapshot()
+        {
+            if (_pendingSnapshotDelta >= _options.forcedKeyIntervalSeconds)
+            {
+                return true;
+            }
+
+            float positionDeltaSq = _options.capturePositionDelta * _options.capturePositionDelta;
+            for (int i = 0; i < _boundTransforms.Count; i++)
+            {
+                Transform target = _boundTransforms[i];
+                if (target == null) continue;
+
+                if (_options.capturePositionDelta > 0f &&
+                    (target.localPosition - _lastSnapshotPositions[i]).sqrMagnitude >= positionDeltaSq)
+                {
+                    return true;
+                }
+
+                if (_options.captureRotationDeltaDegrees > 0f &&
+                    Quaternion.Angle(target.localRotation, _lastSnapshotRotations[i]) >=
+                    _options.captureRotationDeltaDegrees)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private void TakePendingSnapshot()
+        {
+            if (_recorder == null || _pendingSnapshotDelta <= 0f) return;
+
+            _recorder.TakeSnapshot(_pendingSnapshotDelta);
+            _pendingSnapshotDelta = 0f;
+            CacheSnapshotPose();
+        }
+
+        private void CacheSnapshotPose()
+        {
+            if (_lastSnapshotPositions == null || _lastSnapshotPositions.Length != _boundTransforms.Count)
+            {
+                _lastSnapshotPositions = new Vector3[_boundTransforms.Count];
+                _lastSnapshotRotations = new Quaternion[_boundTransforms.Count];
+            }
+
+            for (int i = 0; i < _boundTransforms.Count; i++)
+            {
+                Transform target = _boundTransforms[i];
+                if (target == null) continue;
+                _lastSnapshotPositions[i] = target.localPosition;
+                _lastSnapshotRotations[i] = target.localRotation;
+            }
+        }
+
+        private static TransformRecordingOptions SanitizeOptions(TransformRecordingOptions options)
+        {
+            options.bakePositionErrorPercent = Mathf.Max(0f, options.bakePositionErrorPercent);
+            options.bakeRotationErrorDegrees = Mathf.Max(0f, options.bakeRotationErrorDegrees);
+            options.capturePositionDelta = Mathf.Max(0f, options.capturePositionDelta);
+            options.captureRotationDeltaDegrees = Mathf.Max(0f, options.captureRotationDeltaDegrees);
+            options.forcedKeyIntervalSeconds = Mathf.Max(0.01f, options.forcedKeyIntervalSeconds);
+            return options;
         }
 
         private void OnDestroy()
@@ -386,6 +519,12 @@ namespace MocapTools
         public float RecordingDuration => 0f;
 
         public void BeginRecording(Transform characterRoot, Transform boneRoot, int fps, float startDelaySeconds)
+        {
+            Debug.LogWarning("[MocapRecorder] Recording is only available in the Unity Editor.");
+        }
+
+        public void BeginRecording(Transform characterRoot, Transform boneRoot, int fps, float startDelaySeconds,
+            TransformRecordingOptions options)
         {
             Debug.LogWarning("[MocapRecorder] Recording is only available in the Unity Editor.");
         }
