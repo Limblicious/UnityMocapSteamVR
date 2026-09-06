@@ -36,6 +36,7 @@ namespace MocapTools
         // Record mode settings
         private RecordMode _recordMode = RecordMode.Transform;
         private bool _recordRootMotion = false;
+        private bool _recordRootMotionTransform = true;
         private bool _enableAdaptiveSampling = true;
         private float _adaptiveTolerance = 0.005f;
         private float _adaptiveMaxInterval = 0.5f;
@@ -74,6 +75,7 @@ namespace MocapTools
         private const string PREFS_AUTO_FBX = "MocapRecorder_AutoFbx";
         private const string PREFS_RECORD_MODE = "MocapRecorder_RecordMode";
         private const string PREFS_ROOT_MOTION = "MocapRecorder_RootMotion";
+        private const string PREFS_ROOT_MOTION_TRANSFORM = "MocapRecorder_RootMotionTransform";
         private const string PREFS_ADAPTIVE_SAMPLING = "MocapRecorder_AdaptiveSampling";
         private const string PREFS_ADAPTIVE_TOLERANCE = "MocapRecorder_AdaptiveTolerance";
         private const string PREFS_ADAPTIVE_INTERVAL = "MocapRecorder_AdaptiveMaxInterval";
@@ -344,6 +346,14 @@ namespace MocapTools
         {
             EditorGUILayout.Space(3);
 
+            _recordRootMotionTransform = EditorGUILayout.Toggle(
+                new GUIContent("Record Root Motion", "Also record the character root's world position/rotation so physical locomotion is captured. " +
+                                                   "Clip paths gain the character name prefix (play the clip on a static parent of the avatar). " +
+                                                   "OFF for in-place clips relative to the character root."),
+                _recordRootMotionTransform);
+
+            EditorGUILayout.Space(3);
+
             _enableBakeReduction = EditorGUILayout.Toggle(
                 new GUIContent("Bake Key Reduction", "Use Unity's rotation-aware key reducer when creating the clip."),
                 _enableBakeReduction);
@@ -556,6 +566,80 @@ namespace MocapTools
             Repaint();
         }
 
+        /// <summary>
+        /// Voice-command entry point ("start recording"): arms recording using the
+        /// current window settings. Errors are logged instead of shown as dialogs.
+        /// </summary>
+        public static void ArmFromVoice()
+        {
+            var window = GetWindow<MocapTakeRecorderWindow>("Mocap Take Recorder", false);
+
+            if (!Application.isPlaying)
+            {
+                Debug.LogError("[MocapRecorder] Voice arm failed: enter Play Mode first.");
+                return;
+            }
+
+            if (window._isArmed)
+            {
+                Debug.LogWarning("[MocapRecorder] Voice arm ignored: already armed or recording.");
+                return;
+            }
+
+            // Auto-resolve the character root if the window has none assigned.
+            if (window._characterRoot == null)
+            {
+                var go = GameObject.Find("LinnraNunvAnim(Clone)");
+                if (go != null)
+                {
+                    window._characterRoot = go.transform;
+                    window._resolvedBoneRoot = window.ResolveBoneRoot(window._characterRoot);
+                    window._resolvedAnimator = window._characterRoot.GetComponentInChildren<Animator>();
+                    Debug.Log($"[MocapRecorder] Voice arm auto-resolved character root: {go.name}");
+                }
+            }
+
+            if (window._characterRoot == null)
+            {
+                Debug.LogError("[MocapRecorder] Voice arm failed: Character Root not assigned and LinnraNunvAnim(Clone) not found.");
+                return;
+            }
+
+            // Pre-validate without dialogs; ArmRecording only runs when it will succeed.
+            if (window._recordMode == RecordMode.Transform && window._resolvedBoneRoot == null)
+            {
+                Debug.LogError("[MocapRecorder] Voice arm failed: could not resolve bone root.");
+                return;
+            }
+
+            if (window._recordMode == RecordMode.Humanoid &&
+                (window._resolvedAnimator == null || !window._resolvedAnimator.isHuman))
+            {
+                Debug.LogError("[MocapRecorder] Voice arm failed: Humanoid mode requires a Humanoid Animator.");
+                return;
+            }
+
+            Debug.Log("[MocapRecorder] Voice command: arming recording.");
+            window.ArmRecording();
+        }
+
+        /// <summary>
+        /// Voice-command entry point ("stop recording"): stops and saves the clip.
+        /// </summary>
+        public static void StopFromVoice()
+        {
+            var window = GetWindow<MocapTakeRecorderWindow>("Mocap Take Recorder", false);
+
+            if (!window._isArmed)
+            {
+                Debug.LogWarning("[MocapRecorder] Voice stop ignored: nothing armed.");
+                return;
+            }
+
+            Debug.Log("[MocapRecorder] Voice command: stopping recording.");
+            window.StopRecording();
+        }
+
         private void ArmTransformRecording()
         {
             // Resolve bone root (re-resolve in case hierarchy changed)
@@ -571,6 +655,7 @@ namespace MocapTools
 
             Debug.Log($"[MocapRecorder] Transform mode - Clip paths relative to: {_characterRoot.name}");
             Debug.Log($"[MocapRecorder] Recording bones under: {GetRelativePath(_characterRoot, _resolvedBoneRoot)}");
+            Debug.Log($"[MocapRecorder] Transform mode - RootMotion: {_recordRootMotionTransform}");
 
             // Get or create the recorder
             _recorder = GetOrCreateRecorder();
@@ -595,6 +680,7 @@ namespace MocapTools
             options.capturePositionDelta = _capturePositionDelta;
             options.captureRotationDeltaDegrees = _captureRotationDeltaDegrees;
             options.forcedKeyIntervalSeconds = _captureForcedKeyInterval;
+            options.recordRootMotion = _recordRootMotionTransform;
             _recorder.BeginRecording(_characterRoot, _resolvedBoneRoot, _fps, _countdownSeconds, options);
         }
 
@@ -984,6 +1070,7 @@ namespace MocapTools
             _autoExportFbx = EditorPrefs.GetBool(PREFS_AUTO_FBX, false);
             _recordMode = (RecordMode)EditorPrefs.GetInt(PREFS_RECORD_MODE, 0);
             _recordRootMotion = EditorPrefs.GetBool(PREFS_ROOT_MOTION, false);
+            _recordRootMotionTransform = EditorPrefs.GetBool(PREFS_ROOT_MOTION_TRANSFORM, true);
             _enableAdaptiveSampling = EditorPrefs.GetBool(PREFS_ADAPTIVE_SAMPLING, true);
             _adaptiveTolerance = EditorPrefs.GetFloat(PREFS_ADAPTIVE_TOLERANCE, 0.005f);
             _adaptiveMaxInterval = EditorPrefs.GetFloat(PREFS_ADAPTIVE_INTERVAL, 0.5f);
@@ -1020,6 +1107,7 @@ namespace MocapTools
             EditorPrefs.SetBool(PREFS_AUTO_FBX, _autoExportFbx);
             EditorPrefs.SetInt(PREFS_RECORD_MODE, (int)_recordMode);
             EditorPrefs.SetBool(PREFS_ROOT_MOTION, _recordRootMotion);
+            EditorPrefs.SetBool(PREFS_ROOT_MOTION_TRANSFORM, _recordRootMotionTransform);
             EditorPrefs.SetBool(PREFS_ADAPTIVE_SAMPLING, _enableAdaptiveSampling);
             EditorPrefs.SetFloat(PREFS_ADAPTIVE_TOLERANCE, _adaptiveTolerance);
             EditorPrefs.SetFloat(PREFS_ADAPTIVE_INTERVAL, _adaptiveMaxInterval);

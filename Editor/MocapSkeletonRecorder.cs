@@ -25,6 +25,7 @@ namespace MocapTools
             public float capturePositionDelta;
             public float captureRotationDeltaDegrees;
             public float forcedKeyIntervalSeconds;
+            public bool recordRootMotion;
 
             public static TransformRecordingOptions Default => new TransformRecordingOptions
             {
@@ -34,7 +35,8 @@ namespace MocapTools
                 enableCaptureDeltaGate = false,
                 capturePositionDelta = 0.0005f,
                 captureRotationDeltaDegrees = 0.25f,
-                forcedKeyIntervalSeconds = 0.5f
+                forcedKeyIntervalSeconds = 0.5f,
+                recordRootMotion = false
             };
         }
 
@@ -43,6 +45,8 @@ namespace MocapTools
         private GameObjectRecorder _recorder;
         private Transform _characterRoot;  // Top-level character (Animator root) - recorder is relative to this
         private Transform _boneRoot;       // Bone hierarchy root (e.g., Armature) - only these transforms are recorded
+        private bool _recordRootMotion;    // When true, the character root's world pose is recorded too
+        private GameObject _anchorRoot;    // Static world anchor used as the recorder root for root motion
         private int _targetFps;
         private int _previousCaptureFramerate;
         private bool _isRecording;
@@ -147,13 +151,38 @@ namespace MocapTools
             _previousCaptureFramerate = Time.captureFramerate;
             Time.captureFramerate = _targetFps;
 
-            // Create the GameObjectRecorder relative to CHARACTER ROOT
-            // This ensures curve paths include "Armature/Hips/..." instead of just "Hips/..."
-            _recorder = new GameObjectRecorder(_characterRoot.gameObject);
+            _recordRootMotion = _options.recordRootMotion;
 
-            // Bind ONLY transforms under BONE ROOT (not tracker objects or other children)
-            _boundTransforms.Clear();
-            BindTransformsRecursive(_boneRoot);
+            // Create the GameObjectRecorder. Without root motion the recorder is
+            // relative to CHARACTER ROOT, so curve paths are "Armature/Hips/...".
+            // With root motion the recorder is relative to a static world anchor
+            // and binds the character root itself, so paths become
+            // "CharacterName/..." and "CharacterName/Armature/Hips/..." and the
+            // clip carries world-space locomotion for the whole character.
+            if (_recordRootMotion)
+            {
+                _anchorRoot = new GameObject("MocapTake Root")
+                {
+                    hideFlags = HideFlags.HideAndDontSave
+                };
+                _anchorRoot.transform.SetPositionAndRotation(Vector3.zero, Quaternion.identity);
+                _anchorRoot.transform.localScale = Vector3.one;
+
+                _recorder = new GameObjectRecorder(_anchorRoot);
+
+                _boundTransforms.Clear();
+                _recorder.BindComponentsOfType<Transform>(_characterRoot.gameObject, recursive: false);
+                _boundTransforms.Add(_characterRoot);
+                BindTransformsRecursive(_boneRoot);
+            }
+            else
+            {
+                _recorder = new GameObjectRecorder(_characterRoot.gameObject);
+
+                // Bind ONLY transforms under BONE ROOT (not tracker objects or other children)
+                _boundTransforms.Clear();
+                BindTransformsRecursive(_boneRoot);
+            }
 
             // Take initial snapshot at t=0 for clean first keyframe
             _recorder.TakeSnapshot(0f);
@@ -165,6 +194,7 @@ namespace MocapTools
 
             Debug.Log($"[MocapRecorder] Recording started at {_targetFps} FPS. " +
                       $"Character: {_characterRoot.name}, Bones: {_boneRoot.name}, " +
+                      $"RootMotion: {_recordRootMotion}, " +
                       $"Capture gate: {_options.enableCaptureDeltaGate}");
             OnRecordingStarted?.Invoke();
         }
@@ -253,10 +283,17 @@ namespace MocapTools
             _isRecording = false;
             _characterRoot = null;
             _boneRoot = null;
+            _recordRootMotion = false;
             _boundTransforms.Clear();
             _lastSnapshotPositions = null;
             _lastSnapshotRotations = null;
             _pendingSnapshotDelta = 0f;
+
+            if (_anchorRoot != null)
+            {
+                DestroyImmediate(_anchorRoot);
+                _anchorRoot = null;
+            }
 
             OnRecordingStopped?.Invoke();
 
@@ -500,6 +537,12 @@ namespace MocapTools
                 _isRecording = false;
                 _isCountingDown = false;
                 Debug.LogWarning("[MocapRecorder] Recorder destroyed while recording. Recording aborted.");
+            }
+
+            if (_anchorRoot != null)
+            {
+                DestroyImmediate(_anchorRoot);
+                _anchorRoot = null;
             }
         }
 

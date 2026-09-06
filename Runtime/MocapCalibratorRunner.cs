@@ -97,6 +97,10 @@ namespace MocapTools
         private Coroutine _calibrationCoroutine;
         private CalibrationRequest _currentRequest;
         private MonoBehaviour _vrikComponent;
+        private bool _vrikWasEnabled;
+        private bool _vrikStateCaptured;
+        private Quaternion _rootYawOffset = Quaternion.identity;
+        private Vector3 _rootOldPos;
         private Animator _animator;
         private bool _animatorWasEnabled;
 
@@ -260,6 +264,12 @@ namespace MocapTools
             {
                 Debug.LogWarning("[MocapCalibrator] VRIK component not found. VRIK will not be enabled after calibration.");
             }
+            else if (_vrikComponent != null)
+            {
+                _vrikWasEnabled = ((Behaviour)_vrikComponent).enabled;
+                _vrikStateCaptured = true;
+                ((Behaviour)_vrikComponent).enabled = false;
+            }
 
             // Build mappings
             var mappings = _currentRequest.CustomMappings ?? GetDefaultMappings();
@@ -321,6 +331,21 @@ namespace MocapTools
             }
 
             Debug.Log($"[MocapCalibrator] Found {validMappings} valid mappings. Starting countdown...");
+
+            // TrackingRoot stays at identity: tracker targets live in the XR tracking
+            // space so the VR camera rig (which is also at identity) keeps its correct pose.
+            // The character root is aligned to the tracked head instead.
+            _currentRequest.TrackingRoot.SetPositionAndRotation(Vector3.zero, Quaternion.identity);
+            _rootYawOffset = Quaternion.identity;
+            _rootOldPos = Vector3.zero;
+
+            // Remove any proportion scaler left over from older calibration runs.
+            var staleScaler = FindFirstObjectByType<MocapProportionScaler>();
+            if (staleScaler != null)
+            {
+                Destroy(staleScaler);
+                Debug.Log("[MocapCalibrator] Removed stale MocapProportionScaler.");
+            }
 
             // Freeze animator during calibration if requested
             if (_currentRequest.FreezeAnimatorDuringCalibration && _animator != null)
@@ -398,40 +423,22 @@ namespace MocapTools
 
             yield return null;
 
-            // Step 1: Align TrackingRoot using head as anchor
-            bool alignmentSuccess = false;
-            foreach (var result in TryAlignTrackingRootToHead(mappings))
+            // Step 1: Align the character root to the tracked head so the avatar
+            // stands where the performer is. TrackingRoot remains at identity, keeping
+            // tracker targets in the XR tracking space and the VR camera rig correct.
+            if (!AlignCharacterRootToHead(mappings))
             {
-                // This is a coroutine that yields, so we iterate through it
-                alignmentSuccess = result;
-                yield return null;
-            }
-
-            if (!alignmentSuccess)
-            {
-                // TryAlignTrackingRootToHead already called Fail()
-                yield break;
+                yield break; // AlignCharacterRootToHead already called Fail()
             }
 
             StatusMessage = "Applying offsets...";
             yield return null;
 
             // Step 2: Apply offsets to each tracker.
-            // Use sampled local averages + aligned TrackingRoot pose to compute
-            // expected tracker world poses, avoiding stale/live data mixing.
+            // TrackingRoot is identity, so sampled local poses equal the tracked world
+            // poses. Using the sampled averages avoids mixing stale and live data.
             Quaternion alignedTRRot = _currentRequest.TrackingRoot.rotation;
             Vector3 alignedTRPos = _currentRequest.TrackingRoot.position;
-
-            // Proportion scaling: collect tracker and bone world positions during
-            // the offset loop, then compute per-limb scale factors after.
-            Vector3 hipTrackerWPos = Vector3.zero;
-            Vector3 footLTrackerWPos = Vector3.zero, footRTrackerWPos = Vector3.zero;
-            Vector3 hipBoneWPos = Vector3.zero;
-            Vector3 footLBoneWPos = Vector3.zero, footRBoneWPos = Vector3.zero;
-            bool hasHip = false, hasFootL = false, hasFootR = false;
-            Transform hipTrackerRef = null;
-            Transform footLTrackerRef = null, footRTrackerRef = null;
-            Transform hipOffsetRef = null, footLOffsetRef = null, footROffsetRef = null;
 
             foreach (var mapping in mappings)
             {
@@ -464,6 +471,12 @@ namespace MocapTools
                 Vector3 avgTrackerLocalPos = AveragePositions(data.LocalPositions);
                 Quaternion avgTrackerLocalRot = AverageRotations(data.LocalRotations);
 
+                // Bone samples were captured before the character root was aligned.
+                // Transform them into the aligned root frame so offsets do not bake
+                // in the pre-alignment translation/rotation.
+                Vector3 avgBonePosAligned = _rootYawOffset * (avgBonePos - _rootOldPos) + _currentRequest.CharacterRoot.position;
+                Quaternion avgBoneRotAligned = _rootYawOffset * avgBoneRot;
+
                 // Compute expected tracker world pose from sampled local pose + aligned TrackingRoot.
                 // This uses all data from the same sampling window, eliminating drift from
                 // the frames between sampling and offset application.
@@ -471,44 +484,12 @@ namespace MocapTools
                 Quaternion expectedWorldRot = alignedTRRot * avgTrackerLocalRot;
 
                 // Offset from expected tracker pose to bone pose (manual InverseTransformPoint)
-                Vector3 localPos = Quaternion.Inverse(expectedWorldRot) * (avgBonePos - expectedWorldPos);
-                Quaternion localRot = Quaternion.Inverse(expectedWorldRot) * avgBoneRot;
+                Vector3 localPos = Quaternion.Inverse(expectedWorldRot) * (avgBonePosAligned - expectedWorldPos);
+                Quaternion localRot = Quaternion.Inverse(expectedWorldRot) * avgBoneRotAligned;
 
-                // Collect proportion data for scaled trackers
-                bool isHand = (mapping.Bone == HumanBodyBones.LeftHand ||
-                               mapping.Bone == HumanBodyBones.RightHand);
-                bool isHip = (mapping.Bone == HumanBodyBones.Hips);
-                bool isFoot = (mapping.Bone == HumanBodyBones.LeftFoot ||
-                               mapping.Bone == HumanBodyBones.RightFoot);
-
-                if (isHip)
-                {
-                    hipTrackerWPos = expectedWorldPos;
-                    hipBoneWPos = avgBonePos;
-                    hipTrackerRef = mapping.TrackerTransform;
-                    hipOffsetRef = mapping.OffsetTransform;
-                    hasHip = true;
-                }
-                else if (mapping.Bone == HumanBodyBones.LeftFoot)
-                {
-                    footLTrackerWPos = expectedWorldPos;
-                    footLBoneWPos = avgBonePos;
-                    footLTrackerRef = mapping.TrackerTransform;
-                    footLOffsetRef = mapping.OffsetTransform;
-                    hasFootL = true;
-                }
-                else if (mapping.Bone == HumanBodyBones.RightFoot)
-                {
-                    footRTrackerWPos = expectedWorldPos;
-                    footRBoneWPos = avgBonePos;
-                    footRTrackerRef = mapping.TrackerTransform;
-                    footROffsetRef = mapping.OffsetTransform;
-                    hasFootR = true;
-                }
-
-                // Hands: zero position - hand trackers have high accuracy.
-                // Hips/Feet: zero position - proportion scaler handles positioning.
-                if (isHand || isHip || isFoot)
+                // Hands: zero position - wrist trackers have high accuracy.
+                if (mapping.Bone == HumanBodyBones.LeftHand ||
+                    mapping.Bone == HumanBodyBones.RightHand)
                 {
                     localPos = Vector3.zero;
                 }
@@ -537,55 +518,7 @@ namespace MocapTools
                           $"localPos={localPos}, localRot={localRot.eulerAngles}");
             }
 
-            // Step 3: Create runtime proportion scaler.
-            // Hip target follows the dedicated hip tracker directly (no head coupling).
-            // Feet are scaled relative to the raw hip tracker position.
-            // Scale factors measure user leg length vs avatar leg length at T-pose.
-            // TorsoScale is intentionally removed: the old head->hip torso vector caused
-            // the hip VRIK target to whip when the head moved. With a dedicated hip tracker,
-            // the tracker is ground truth and is used directly.
-            if (hasHip)
-            {
-                float legScaleL = 1f;
-                float legScaleR = 1f;
-
-                if (hasFootL)
-                {
-                    float userLegL = Vector3.Distance(hipTrackerWPos, footLTrackerWPos);
-                    float avatarLegL = Vector3.Distance(hipBoneWPos, footLBoneWPos);
-                    legScaleL = (userLegL > 0.01f) ? (avatarLegL / userLegL) : 1f;
-                }
-
-                if (hasFootR)
-                {
-                    float userLegR = Vector3.Distance(hipTrackerWPos, footRTrackerWPos);
-                    float avatarLegR = Vector3.Distance(hipBoneWPos, footRBoneWPos);
-                    legScaleR = (userLegR > 0.01f) ? (avatarLegR / userLegR) : 1f;
-                }
-
-                // Create or reuse the proportion scaler on this GameObject
-                var scaler = gameObject.GetComponent<MocapProportionScaler>();
-                if (scaler == null)
-                    scaler = gameObject.AddComponent<MocapProportionScaler>();
-
-                scaler.HipTracker = hipTrackerRef;
-                scaler.FootLTracker = footLTrackerRef;
-                scaler.FootRTracker = footRTrackerRef;
-                scaler.HipOffset = hipOffsetRef;
-                scaler.FootLOffset = footLOffsetRef;
-                scaler.FootROffset = footROffsetRef;
-                scaler.LegScaleL = legScaleL;
-                scaler.LegScaleR = legScaleR;
-
-                Debug.Log($"[MocapCalibrator] Proportion scaler configured:\n" +
-                          $"  Hip: tracker direct (no head coupling)\n" +
-                          $"  LegL - Scale: {legScaleL:F3}\n" +
-                          $"  LegR - Scale: {legScaleR:F3}");
-            }
-            else
-            {
-                Debug.LogWarning("[MocapCalibrator] Could not configure proportion scaler - hip tracker not found.");
-            }
+            ConfigureVRIKTargets(mappings);
 
             // Restore animator state
             RestoreComponents();
@@ -626,11 +559,12 @@ namespace MocapTools
         }
 
         /// <summary>
-        /// Aligns the TrackingRoot transform so that Tracked_Head matches the avatar's Head bone pose.
-        /// This makes the head the "anchor" or source of truth for the tracking coordinate space.
-        /// Returns an IEnumerable that yields true on success, false on failure.
+        /// Moves the character root so the avatar's head matches the tracked head
+        /// (translation only). TrackingRoot remains at identity, so tracker targets
+        /// stay in the XR tracking space and the VR camera rig keeps its correct pose.
+        /// Returns true on success, false on failure.
         /// </summary>
-        private IEnumerable<bool> TryAlignTrackingRootToHead(List<TrackerMapping> mappings)
+        private bool AlignCharacterRootToHead(List<TrackerMapping> mappings)
         {
             // Find the head mapping
             TrackerMapping headMapping = null;
@@ -649,74 +583,47 @@ namespace MocapTools
                 }
             }
 
-            if (headMapping == null || headSamples == null)
+            if (headMapping == null || headSamples == null ||
+                headSamples.LocalPositions.Count == 0 ||
+                headSamples.BonePositions.Count == 0)
             {
                 Fail("Head tracker (Tracked_Head) not found or invalid. Head is required as the calibration anchor.");
-                yield return false;
-                yield break;
+                return false;
             }
 
-            if (headSamples.LocalPositions.Count == 0)
+            if (_currentRequest.CharacterRoot == null)
             {
-                Fail("No samples collected for head tracker.");
-                yield return false;
-                yield break;
+                Fail("CharacterRoot must be assigned for head-anchored calibration.");
+                return false;
             }
 
-            // Require TrackingRoot to be assigned for alignment
-            if (_currentRequest.TrackingRoot == null)
-            {
-                Fail("TrackingRoot must be assigned for head-anchored calibration. " +
-                     "The TrackingRoot transform will be repositioned to align trackers with the avatar.");
-                yield return false;
-                yield break;
-            }
-
-            // Compute averages from samples
-            Vector3 avgHeadTrackerLocalPos = AveragePositions(headSamples.LocalPositions);
-            Quaternion avgHeadTrackerLocalRot = AverageRotations(headSamples.LocalRotations);
+            // TrackingRoot is identity, so tracked local poses equal world poses.
+            Vector3 avgHeadTrackerWorldPos = AveragePositions(headSamples.LocalPositions);
+            Quaternion avgHeadTrackerWorldRot = AverageRotations(headSamples.LocalRotations);
             Vector3 avgHeadBoneWorldPos = AveragePositions(headSamples.BonePositions);
             Quaternion avgHeadBoneWorldRot = AverageRotations(headSamples.BoneRotations);
 
-            // Compute full rotation that would match head tracker to head bone:
-            //   fullRot * avgHeadTrackerLocalRot == avgHeadBoneWorldRot
-            Quaternion fullAlignRot = avgHeadBoneWorldRot * Quaternion.Inverse(avgHeadTrackerLocalRot);
+            Transform root = _currentRequest.CharacterRoot;
+            _rootOldPos = root.position;
 
-            // Extract YAW only for TrackingRoot alignment.
-            // Applying full pitch/roll to TrackingRoot shifts all non-head trackers
-            // laterally (e.g., hip pushed to the side from even small head tilts).
-            // Per-tracker offsets handle remaining pitch/roll individually.
-            Vector3 fullEuler = fullAlignRot.eulerAngles;
-            Quaternion newTrackingRootRot = Quaternion.Euler(0f, fullEuler.y, 0f);
+            // Yaw-align the avatar to the tracked head, then translate it so the
+            // avatar head sits exactly on the tracked head. Sampled bone poses are
+            // transformed into this aligned frame later when offsets are computed.
+            float trackerYaw = avgHeadTrackerWorldRot.eulerAngles.y;
+            float boneYaw = avgHeadBoneWorldRot.eulerAngles.y;
+            _rootYawOffset = Quaternion.Euler(0f, trackerYaw - boneYaw, 0f);
 
-            Vector3 newTrackingRootPos = avgHeadBoneWorldPos - (newTrackingRootRot * avgHeadTrackerLocalPos);
+            Vector3 oldPos = root.position;
+            root.rotation = _rootYawOffset * root.rotation;
+            root.position = avgHeadTrackerWorldPos - _rootYawOffset * (avgHeadBoneWorldPos - _rootOldPos);
 
-            // Store old values for logging
-            Vector3 oldPos = _currentRequest.TrackingRoot.position;
-            Quaternion oldRot = _currentRequest.TrackingRoot.rotation;
+            Debug.Log($"[MocapCalibrator] Character root aligned to head anchor:\n" +
+                      $"  Old pos: {oldPos}\n" +
+                      $"  New pos: {root.position}\n" +
+                      $"  Yaw delta: {trackerYaw - boneYaw:F2}°\n" +
+                      $"  Head error after alignment: {Vector3.Distance(headMapping.TrackerTransform.position, headMapping.BoneTransform.position):F4}m");
 
-            // Apply new TrackingRoot pose
-            _currentRequest.TrackingRoot.rotation = newTrackingRootRot;
-            _currentRequest.TrackingRoot.position = newTrackingRootPos;
-
-            Debug.Log($"[MocapCalibrator] TrackingRoot aligned to head anchor:\n" +
-                      $"  Old pos: {oldPos}, rot: {oldRot.eulerAngles}\n" +
-                      $"  New pos: {newTrackingRootPos}, rot: {newTrackingRootRot.eulerAngles}");
-
-            // Wait one frame for all tracked children to update their world transforms
-            yield return true;
-
-            // Verify alignment (optional debug)
-            Vector3 headTrackerWorldPos = headMapping.TrackerTransform.position;
-            Quaternion headTrackerWorldRot = headMapping.TrackerTransform.rotation;
-            float posError = Vector3.Distance(headTrackerWorldPos, avgHeadBoneWorldPos);
-            float rotError = Quaternion.Angle(headTrackerWorldRot, avgHeadBoneWorldRot);
-
-            Debug.Log($"[MocapCalibrator] Head alignment verification:\n" +
-                      $"  Tracker pos: {headTrackerWorldPos}, Bone pos: {avgHeadBoneWorldPos}, Error: {posError:F4}m\n" +
-                      $"  Tracker rot: {headTrackerWorldRot.eulerAngles}, Bone rot: {avgHeadBoneWorldRot.eulerAngles}, Error: {rotError:F2}°");
-
-            yield return true;
+            return true;
         }
 
         private void RestoreComponents()
@@ -728,6 +635,123 @@ namespace MocapTools
                 _animator.enabled = _animatorWasEnabled;
                 Debug.Log("[MocapCalibrator] Animator restored.");
             }
+
+            if (_vrikStateCaptured && _vrikComponent != null)
+            {
+                ((Behaviour)_vrikComponent).enabled = _vrikWasEnabled;
+                _vrikStateCaptured = false;
+            }
+        }
+
+        private void ConfigureVRIKTargets(List<TrackerMapping> mappings)
+        {
+            if (_vrikComponent == null)
+                return;
+
+            object solver = GetMemberValue(_vrikComponent, "solver");
+            if (solver == null)
+            {
+                Debug.LogWarning("[MocapCalibrator] Could not access the VRIK solver to assign calibrated targets.");
+                return;
+            }
+
+            int assigned = 0;
+            foreach (var mapping in mappings)
+            {
+                if (!mapping.IsValid || mapping.OffsetTransform == null)
+                    continue;
+
+                string solverPart;
+                string targetMember;
+                switch (mapping.Bone)
+                {
+                    case HumanBodyBones.Head:
+                        solverPart = "spine";
+                        targetMember = "headTarget";
+                        break;
+                    case HumanBodyBones.Hips:
+                        solverPart = "spine";
+                        targetMember = "pelvisTarget";
+                        break;
+                    case HumanBodyBones.LeftHand:
+                        solverPart = "leftArm";
+                        targetMember = "target";
+                        break;
+                    case HumanBodyBones.RightHand:
+                        solverPart = "rightArm";
+                        targetMember = "target";
+                        break;
+                    case HumanBodyBones.LeftFoot:
+                        solverPart = "leftLeg";
+                        targetMember = "target";
+                        break;
+                    case HumanBodyBones.RightFoot:
+                        solverPart = "rightLeg";
+                        targetMember = "target";
+                        break;
+                    case HumanBodyBones.LeftLowerArm:
+                        solverPart = "leftArm";
+                        targetMember = "bendGoal";
+                        break;
+                    case HumanBodyBones.RightLowerArm:
+                        solverPart = "rightArm";
+                        targetMember = "bendGoal";
+                        break;
+                    default:
+                        continue;
+                }
+
+                object part = GetMemberValue(solver, solverPart);
+                if (part != null && SetMemberValue(part, targetMember, mapping.OffsetTransform))
+                    assigned++;
+                else
+                    Debug.LogWarning($"[MocapCalibrator] Could not assign VRIK {solverPart}.{targetMember}.");
+            }
+
+            Debug.Log($"[MocapCalibrator] Assigned {assigned} calibrated VRIK target(s).");
+        }
+
+        private static object GetMemberValue(object target, string memberName)
+        {
+            if (target == null)
+                return null;
+
+            const System.Reflection.BindingFlags flags =
+                System.Reflection.BindingFlags.Instance |
+                System.Reflection.BindingFlags.Public |
+                System.Reflection.BindingFlags.NonPublic;
+            var type = target.GetType();
+            var field = type.GetField(memberName, flags);
+            if (field != null)
+                return field.GetValue(target);
+
+            var property = type.GetProperty(memberName, flags);
+            return property != null && property.CanRead ? property.GetValue(target) : null;
+        }
+
+        private static bool SetMemberValue(object target, string memberName, object value)
+        {
+            if (target == null)
+                return false;
+
+            const System.Reflection.BindingFlags flags =
+                System.Reflection.BindingFlags.Instance |
+                System.Reflection.BindingFlags.Public |
+                System.Reflection.BindingFlags.NonPublic;
+            var type = target.GetType();
+            var field = type.GetField(memberName, flags);
+            if (field != null)
+            {
+                field.SetValue(target, value);
+                return true;
+            }
+
+            var property = type.GetProperty(memberName, flags);
+            if (property == null || !property.CanWrite)
+                return false;
+
+            property.SetValue(target, value);
+            return true;
         }
 
         private Transform FindTrackerTransform(Transform trackingRoot, string trackerName)

@@ -93,9 +93,9 @@ namespace MocapTools
         float _lastPacketTime = float.NegativeInfinity;
         bool _loggedBind;
         bool _loggedFirstDatagram;
-        bool _loggedFirstKinematic;
+        int _loggedKinematicMask;
         int _firstDatagramLength;
-        int _firstKinematicHand;
+        int _receivedKinematicMask;
         int _pendingKinematicMask;
         int _pendingOrientationMask;
         int _validOrientationMask;
@@ -133,11 +133,18 @@ namespace MocapTools
                 Debug.Log("[MocapOSC] First datagram received: " + firstDatagramLength + " bytes.");
             }
 
-            int firstKinematicHand = Volatile.Read(ref _firstKinematicHand);
-            if (!_loggedFirstKinematic && firstKinematicHand != 0)
+            int receivedKinematicMask = Volatile.Read(ref _receivedKinematicMask);
+            int newKinematicHands = receivedKinematicMask & ~_loggedKinematicMask;
+            if ((newKinematicHands & (1 << LeftHand)) != 0)
             {
-                _loggedFirstKinematic = true;
-                Debug.Log($"[MocapOSC] First kinematic packet: hand={firstKinematicHand} " +
+                _loggedKinematicMask |= 1 << LeftHand;
+                Debug.Log($"[MocapOSC] First kinematic packet: hand={LeftHand} " +
+                          $"({GloveKinematicFrame.JointCount} joints).");
+            }
+            if ((newKinematicHands & (1 << RightHand)) != 0)
+            {
+                _loggedKinematicMask |= 1 << RightHand;
+                Debug.Log($"[MocapOSC] First kinematic packet: hand={RightHand} " +
                           $"({GloveKinematicFrame.JointCount} joints).");
             }
 
@@ -304,9 +311,9 @@ namespace MocapTools
             }
 
             _firstDatagramLength = 0;
-            _firstKinematicHand = 0;
+            _receivedKinematicMask = 0;
             _loggedFirstDatagram = false;
-            _loggedFirstKinematic = false;
+            _loggedKinematicMask = 0;
             _lastStatusLogTime = Time.realtimeSinceStartup;
             _running = true;
             _clock.Restart();
@@ -450,7 +457,8 @@ namespace MocapTools
                     _lastPacketTime = receivedTime;
                 }
                 Interlocked.Increment(ref _packetsSinceLog);
-                Interlocked.CompareExchange(ref _firstKinematicHand, handedness, 0);
+                Volatile.Write(ref _receivedKinematicMask,
+                    _receivedKinematicMask | (1 << handedness));
             }
             else
             {
