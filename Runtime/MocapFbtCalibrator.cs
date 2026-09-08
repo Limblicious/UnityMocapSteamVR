@@ -1,4 +1,3 @@
-using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.XR;
@@ -10,13 +9,15 @@ namespace MocapTools
     ///
     /// Mirrors the documented VRChat flow
     /// (docs.vrchat.com/docs/full-body-tracking, "Using Full-Body Tracking in VRChat"):
-    ///   - The avatar is pinned to the HMD while calibrating.
+    ///   - The avatar enters a deterministic calibration reference pose while
+    ///     calibrating; normal live FBT is not used as the calibration pose.
+    ///   - The avatar's configured View Position is anchored to the HMD as a
+    ///     first-class 3D calibration invariant (not X/Z + floor).
     ///   - Tracker spheres show where each tracker is.
     ///   - The performer stands straight, looks forward, and confirms with both triggers.
     ///
     /// Also implements the IK 2.0 documented concepts (docs.vrchat.com/docs/ik-20-features-and-options):
     ///   - Avatar measurement by height (uniform scale to the tracked eye height).
-    ///   - Lock Head spine behavior (strict head pin, pelvis may drift).
     ///   - Calibration saving (JSON profile re-applied on later sessions).
     ///
     /// The "Adjust FBT" sphere-grab interaction is a screenshot-derived design:
@@ -46,11 +47,10 @@ namespace MocapTools
         public MocapFbtUi ui;
 
         [Header("Settings")]
-        public bool autoApplySavedProfile = true;
         [Tooltip("How long to sample after both triggers are pressed.")]
         public float confirmSampleSeconds = 0.5f;
-        [Tooltip("Head-bone-local offset to the avatar viewpoint, used when avatarViewpoint is not assigned.")]
-        public Vector3 eyeLocalOffset = new Vector3(0f, 0.0565f, 0.037f);
+        [Tooltip("Optional clip sampled once as the deterministic calibration reference pose. Defaults to the avatar's neutral humanoid pose.")]
+        public AnimationClip calibrationPoseClip;
         public float minScale = 0.8f;
         public float maxScale = 1.4f;
         [Tooltip("Reach distance for grabbing adjustment spheres (m).")]
@@ -78,7 +78,7 @@ namespace MocapTools
 
         // Confirmation sampling
         float _sampleTimer;
-        bool _confirmingFrozen;
+        HumanPoseHandler _poseHandler;
         class SampleAccum
         {
             public readonly List<Vector3> TrackerPositions = new List<Vector3>();
@@ -98,8 +98,10 @@ namespace MocapTools
         #region Public API
 
         /// <summary>
-        /// Enters calibration mode: disables locomotion, scales and pins the avatar
-        /// to the HMD, and shows tracker spheres + mirror. Confirm with both triggers.
+        /// Enters calibration mode: disables locomotion and the live solver,
+        /// freezes the avatar in a deterministic reference pose, scales it and
+        /// anchors its View Position to the HMD, and shows tracker spheres.
+        /// Confirm with both triggers.
         /// </summary>
         public bool EnterCalibrationMode()
         {
@@ -123,17 +125,24 @@ namespace MocapTools
                         ?? MocapFbtCalibrationProfile.CreateDefaults();
             _profile.characterName = characterRoot.name;
 
-            // Disable VRIK and freeze the animator while re-anchoring the avatar.
+            // Freeze the character in a deterministic calibration reference
+            // pose: VRIK and the Animator are disabled, then the neutral
+            // humanoid pose (or the optional calibration clip) is applied.
+            // The normal live FBT solve never drives the calibration pose.
             _vrik = MocapFbtReflection.FindVrik(characterRoot);
             if (_vrik != null)
             {
                 _vrikWasEnabled = ((Behaviour)_vrik).enabled;
                 ((Behaviour)_vrik).enabled = false;
             }
+            _animatorWasEnabled = _animator.enabled;
+            _animator.enabled = false;
+            ApplyCalibrationReferencePose();
 
             ResolveBindings(_profile);
 
-            // Uniform scale to the tracked eye height (avatar measurement by height).
+            // Uniform scale to the tracked eye height (avatar measurement by
+            // height), measured in the reference pose.
             float userEyeHeight = headTracker.position.y;
             if (userEyeHeight < 0.5f)
             {
@@ -146,20 +155,18 @@ namespace MocapTools
             characterRoot.localScale = _originalLocalScale * scale;
             Debug.Log($"[MocapFbt] Eye height: user={userEyeHeight:F3}m avatar={avatarEyeHeight:F3}m -> scale={scale:F3}");
 
-            // Root Y stays on the floor; XZ/yaw follow the HMD so the avatar is pinned.
-            _floorY = characterRoot.position.y;
-            _profile.floorY = _floorY;
-
             ApplyBindingOffsets(_profile);
             PinToHead();
             ApplyHeadPinOffset();
 
-            // Live preview: VRIK on with targets assigned, head pinned at a fixed HMD-local offset.
-            MocapFbtReflection.AssignTargets(_vrik, _profile);
-            MocapFbtReflection.ApplyFullTrackingPolicy(_vrik);
-            MocapFbtReflection.ApplyMissingBindingWeights(_vrik, _profile);
-            if (_vrik != null)
-                ((Behaviour)_vrik).enabled = true;
+            // Diagnostics: the avatar viewpoint must coincide with the HMD in
+            // all three axes after anchoring, and any floor conflict must be
+            // surfaced rather than silently hidden.
+            Vector3 residual = GetViewpointWorld() - headTracker.position;
+            Debug.Log($"[MocapFbt] Viewpoint anchoring: HMD={headTracker.position} viewpoint={GetViewpointWorld()} residual={residual.magnitude:F4}m scale={scale:F3}");
+            float floorDelta = _floorY - _originalRootPos.y;
+            if (Mathf.Abs(floorDelta) > 0.1f)
+                Debug.LogWarning($"[MocapFbt] Viewpoint anchoring moved the root Y by {floorDelta:F3}m; floor placement conflicts with the avatar viewpoint.");
 
             if (ui == null) ui = FindFirstObjectByType<MocapFbtUi>();
             if (ui != null) ui.ShowCalibration(_profile.bindings);
@@ -167,6 +174,22 @@ namespace MocapTools
             SetState(FbtState.Calibrating);
             StatusMessage = "Calibration mode. Stand straight, look forward, press both triggers.";
             Debug.Log($"[MocapFbt] Calibration mode entered. Scale={_profile.uniformScale:F3}");
+            return true;
+        }
+
+        /// <summary>
+        /// Voice/alternative trigger for the calibration confirmation step.
+        /// Acts only while calibration is active.
+        /// </summary>
+        public bool ConfirmCalibration()
+        {
+            if (State != FbtState.Calibrating)
+            {
+                Debug.LogWarning("[MocapFbt] Confirm is only available during calibration.");
+                return false;
+            }
+
+            BeginConfirm();
             return true;
         }
 
@@ -229,57 +252,9 @@ namespace MocapTools
             Debug.Log("[MocapFbt] Calibration cancelled; pre-calibration state restored.");
         }
 
-        /// <summary>
-        /// Attempts to re-apply a previously saved profile without recalibrating
-        /// (VRChat IK 2.0 calibration-saving analog).
-        /// </summary>
-        public bool TryApplySavedProfile()
-        {
-            if (State != FbtState.Idle) return false;
-
-            var loaded = MocapFbtCalibrationProfile.Load(MocapFbtCalibrationProfile.DefaultSavePath);
-            if (loaded == null || loaded.characterName != characterRoot.name)
-            {
-                Debug.Log("[MocapFbt] No saved calibration profile for this character.");
-                return false;
-            }
-
-            if (solver == null) solver = FindFirstObjectByType<MocapFbtSolver>();
-
-            CaptureOriginals();
-            characterRoot.localScale = _originalLocalScale * loaded.uniformScale;
-
-            ResolveBindings(loaded);
-            ApplyBindingOffsets(loaded);
-
-            if (solver != null)
-            {
-                solver.ApplyProfile(loaded);
-                solver.SetActive(true);
-            }
-
-            _profile = loaded;
-            StatusMessage = "Saved calibration profile applied.";
-            SetState(FbtState.Active);
-            Debug.Log($"[MocapFbt] Saved profile applied (scale={loaded.uniformScale:F3}).");
-            return true;
-        }
-
         #endregion
 
         #region Unity Lifecycle
-
-        void Start()
-        {
-            if (autoApplySavedProfile && State == FbtState.Idle)
-                StartCoroutine(AutoApplyCoroutine());
-        }
-
-        IEnumerator AutoApplyCoroutine()
-        {
-            yield return null;
-            TryApplySavedProfile();
-        }
 
         void Update()
         {
@@ -303,6 +278,12 @@ namespace MocapTools
             {
                 RestoreOriginals();
                 RestoreComponents();
+            }
+
+            if (_poseHandler != null)
+            {
+                _poseHandler.Dispose();
+                _poseHandler = null;
             }
         }
 
@@ -329,9 +310,9 @@ namespace MocapTools
 
         void BeginConfirm()
         {
-            // Freeze the root and the avatar in its natural standing pose while
-            // sampling tracker-to-bone offsets (mount geometry).
-            _confirmingFrozen = true;
+            // The character is already frozen in the reference pose (Animator
+            // and VRIK disabled at calibration entry). Sample tracker-to-bone
+            // offsets (mount geometry) while the performer holds still.
             _sampleTimer = 0f;
             _samples = new Dictionary<MocapFbtBinding, SampleAccum>();
             foreach (var binding in _profile.bindings)
@@ -342,11 +323,6 @@ namespace MocapTools
 
             if (_vrik != null)
                 ((Behaviour)_vrik).enabled = false;
-            if (_animator != null)
-            {
-                _animatorWasEnabled = _animator.enabled;
-                _animator.enabled = false;
-            }
 
             SetState(FbtState.Confirming);
             StatusMessage = "Sampling... hold still.";
@@ -544,6 +520,12 @@ namespace MocapTools
             error = null;
             if (characterRoot == null) { error = "characterRoot is not assigned."; return false; }
 
+            if (avatarViewpoint == null)
+            {
+                error = "avatarViewpoint is not assigned. Create one with Tools/Mocap/Create Avatar View Point and assign it on the TrackerPoseRelay.";
+                return false;
+            }
+
             _animator = characterRoot.GetComponentInChildren<Animator>();
             if (_animator == null || !_animator.isHuman)
             {
@@ -570,19 +552,13 @@ namespace MocapTools
         }
 
         /// <summary>
-        /// Current avatar viewpoint in world space: the serialized avatarViewpoint
-        /// if assigned, otherwise the Head bone plus the eye offset. Computed live
-        /// so it always reflects the avatar's current scale.
+        /// Current avatar viewpoint in world space. The viewpoint is an
+        /// explicitly placed scene object (VRChat View Position analog);
+        /// validation guarantees it is assigned during calibration.
         /// </summary>
         Vector3 GetViewpointWorld()
         {
-            if (avatarViewpoint != null)
-                return avatarViewpoint.position;
-
-            if (_headBone == null)
-                return characterRoot != null ? characterRoot.position : Vector3.zero;
-
-            return _headBone.position + _headBone.rotation * eyeLocalOffset;
+            return avatarViewpoint != null ? avatarViewpoint.position : Vector3.zero;
         }
 
         void CaptureOriginals()
@@ -615,27 +591,67 @@ namespace MocapTools
             if (_vrik != null)
                 ((Behaviour)_vrik).enabled = _vrikWasEnabled;
 
-            if (_animator != null && _confirmingFrozen)
-            {
+            if (_animator != null)
                 _animator.enabled = _animatorWasEnabled;
-                _confirmingFrozen = false;
-            }
         }
 
+        /// <summary>
+        /// Puts the character into a deterministic calibration reference pose:
+        /// the configured calibration clip if assigned, otherwise the avatar's
+        /// neutral humanoid pose (its configured T/A-pose). The Animator must
+        /// be disabled so normal animation does not overwrite the pose.
+        /// </summary>
+        void ApplyCalibrationReferencePose()
+        {
+            if (_animator == null)
+                return;
+
+            if (calibrationPoseClip != null)
+            {
+                calibrationPoseClip.SampleAnimation(characterRoot.gameObject, 0f);
+                Debug.Log($"[MocapFbt] Calibration reference pose sampled from clip '{calibrationPoseClip.name}'.");
+                return;
+            }
+
+            if (_poseHandler != null)
+            {
+                _poseHandler.Dispose();
+                _poseHandler = null;
+            }
+            _poseHandler = new HumanPoseHandler(_animator.avatar, _animator.transform);
+
+            var pose = new HumanPose();
+            _poseHandler.GetHumanPose(ref pose);
+            pose.bodyPosition = Vector3.zero;
+            pose.bodyRotation = Quaternion.identity;
+            if (pose.muscles != null)
+            {
+                for (int i = 0; i < pose.muscles.Length; i++)
+                    pose.muscles[i] = 0f;
+            }
+            _poseHandler.SetHumanPose(ref pose);
+            Debug.Log("[MocapFbt] Calibration reference pose applied (neutral humanoid pose).");
+        }
+
+        /// <summary>
+        /// Anchors the avatar's configured viewpoint to the HMD in all three
+        /// axes (View Position <-> HMD coincidence is the calibration
+        /// invariant). Yaw follows the HMD. Root height is derived from this
+        /// anchoring, so the floor is respected only when it is geometrically
+        /// consistent with the viewpoint.
+        /// </summary>
         void PinToHead()
         {
             if (characterRoot == null || headTracker == null)
                 return;
 
             Vector3 viewpointLocal = characterRoot.InverseTransformPoint(GetViewpointWorld());
-            Vector3 pos = characterRoot.position;
-            pos.x = headTracker.position.x - viewpointLocal.x;
-            pos.z = headTracker.position.z - viewpointLocal.z;
-            pos.y = _floorY;
-            characterRoot.position = pos;
+            Quaternion rootRot = Quaternion.Euler(0f, headTracker.rotation.eulerAngles.y + _profile.yawBias, 0f);
+            characterRoot.rotation = rootRot;
+            characterRoot.position = headTracker.position - rootRot * viewpointLocal;
 
-            // Yaw follows the HMD so the avatar turns with the performer.
-            characterRoot.rotation = Quaternion.Euler(0f, headTracker.rotation.eulerAngles.y + _profile.yawBias, 0f);
+            _floorY = characterRoot.position.y;
+            _profile.floorY = _floorY;
         }
 
         /// <summary>
